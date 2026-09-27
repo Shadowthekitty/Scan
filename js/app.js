@@ -9,7 +9,7 @@ import { defaultParams, saveDoc } from './saver.js';
 import { getScan, requestPersistence, storageEstimate, listScans, deleteScan } from './db.js';
 
 const VIEWS = ['library', 'capture', 'review', 'editor', 'viewer'];
-export const APP_VERSION = '1.2';
+export const APP_VERSION = '1.3';
 
 class App {
   constructor() {
@@ -120,7 +120,10 @@ class App {
   }
 
   enter(view) {
-    if (view === 'library') this.library.refresh();
+    if (view === 'library') {
+      this.library.refresh();
+      if (this.onLibraryShown) this.onLibraryShown();
+    }
     if (view === 'capture') this.capture.open();
   }
 
@@ -301,13 +304,79 @@ class App {
   }
 }
 
+// Updates: check when the app opens and whenever it comes back to the
+// foreground (installed apps are often resumed rather than reopened), and
+// reload once a new version has taken over.
+let swReg = null;
+let lastCheck = 0;
+function checkForUpdate(force) {
+  if (!swReg) return Promise.resolve();
+  const now = Date.now();
+  if (!force && now - lastCheck < 60000) return Promise.resolve();
+  lastCheck = now;
+  return swReg.update().catch(() => {});
+}
+
+function setupUpdates(app) {
+  if (!('serviceWorker' in navigator) || location.protocol === 'file:') return;
+  const hadController = !!navigator.serviceWorker.controller;
+  let reloading = false;
+  const reloadWhenSafe = () => {
+    if (reloading) return;
+    // Never interrupt a scan or an edit: wait until the library is showing.
+    if (app.top === 'library' && document.querySelector('#busy').hidden) {
+      reloading = true;
+      location.reload();
+    } else {
+      app.pendingReload = true;
+      toast('An update is ready. It will load when you go back to your scans.', 5000);
+    }
+  };
+  navigator.serviceWorker.addEventListener('controllerchange', () => {
+    if (hadController) reloadWhenSafe();
+  });
+  app.onLibraryShown = () => { if (app.pendingReload) reloadWhenSafe(); };
+  navigator.serviceWorker.register('sw.js', { updateViaCache: 'none' }).then((reg) => {
+    swReg = reg;
+    checkForUpdate(true);
+  }).catch(() => {});
+  document.addEventListener('visibilitychange', () => { if (!document.hidden) checkForUpdate(false); });
+}
+
+/** Settings > Check for updates. */
+async function manualUpdateCheck() {
+  let latest = null;
+  try {
+    const res = await fetch('version.json', { cache: 'no-store' });
+    latest = (await res.json()).version;
+  } catch (e) {
+    toast('Could not reach the server. Check your connection.');
+    return;
+  }
+  if (latest === APP_VERSION) {
+    toast(`You have the latest version (${APP_VERSION}).`);
+    return;
+  }
+  toast(`Updating to version ${latest}…`, 8000);
+  await checkForUpdate(true);
+  // If no new worker takes over (for example the old one is stuck), clear
+  // the app-file cache (never your scans) and reload from the network.
+  setTimeout(async () => {
+    try {
+      for (const key of await caches.keys()) {
+        const c = await caches.open(key);
+        for (const req of await c.keys()) {
+          if (!/opencv\.js$|\.onnx$/.test(new URL(req.url).pathname)) await c.delete(req);
+        }
+      }
+    } catch (e) { /* ignore */ }
+    location.reload();
+  }, 6000);
+}
+
 window.addEventListener('DOMContentLoaded', () => {
   window.app = new App();
-  if ('serviceWorker' in navigator && location.protocol !== 'file:') {
-    const hadController = !!navigator.serviceWorker.controller;
-    navigator.serviceWorker.addEventListener('controllerchange', () => {
-      if (hadController) toast('Scan was updated. Close and reopen the app to use the new version.', 6000);
-    });
-    navigator.serviceWorker.register('sw.js').catch(() => {});
-  }
+  setupUpdates(window.app);
+  const btn = document.querySelector('#settings-update');
+  if (btn) btn.onclick = () => manualUpdateCheck();
 });

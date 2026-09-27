@@ -135,6 +135,7 @@ npm test
 | `js/editor.js`, `js/saver.js` | Editor and saving |
 | `js/library.js`, `js/db.js` | Library, viewer, album review, storage |
 | `js/exif.js`, `js/zip.js` | EXIF writer (date taken, caption) and ZIP export |
-| `sw.js` | Offline cache. Bump `VERSION` when you change files |
+| `sw.js` | Offline cache. App files load from the network first, so updates appear on the next open |
+| `version.json` | Latest version for Settings > Check for updates. Keep it equal to `APP_VERSION` in `js/app.js` |
 
 See `THIRD_PARTY_NOTICES.md` for the bundled OpenCV.js build and face model.
