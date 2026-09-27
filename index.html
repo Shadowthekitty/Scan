@@ -1,0 +1,255 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <meta name="theme-color" content="#101114">
+  <meta name="description" content="Scan printed photos with your phone: automatic cropping, glare removal and colour restoration. Works offline; nothing leaves your device.">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+  <meta name="apple-mobile-web-app-title" content="Scan">
+  <title>Scan</title>
+  <link rel="manifest" href="manifest.webmanifest">
+  <link rel="icon" href="icons/icon.svg" type="image/svg+xml">
+  <link rel="apple-touch-icon" href="icons/icon-180.png">
+  <link rel="stylesheet" href="css/app.css">
+  <script type="module" src="js/app.js"></script>
+</head>
+<body data-view="library">
+  <svg width="0" height="0" style="position:absolute" aria-hidden="true">
+    <defs>
+      <symbol id="i-close" viewBox="0 0 24 24"><path d="M6 6l12 12M18 6L6 18"/></symbol>
+      <symbol id="i-back" viewBox="0 0 24 24"><path d="M19 12H5M12 19l-7-7 7-7"/></symbol>
+      <symbol id="i-chev-left" viewBox="0 0 24 24"><path d="M15 18l-6-6 6-6"/></symbol>
+      <symbol id="i-chev-right" viewBox="0 0 24 24"><path d="M9 6l6 6-6 6"/></symbol>
+      <symbol id="i-settings" viewBox="0 0 24 24"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/></symbol>
+      <symbol id="i-torch" viewBox="0 0 24 24"><path d="M13 2L3 14h9l-1 8 10-12h-9l1-8z"/></symbol>
+      <symbol id="i-rot-left" viewBox="0 0 24 24"><path d="M1 4v6h6"/><path d="M3.51 15a9 9 0 1 0 2.13-9.36L1 10"/></symbol>
+      <symbol id="i-rot-right" viewBox="0 0 24 24"><path d="M23 4v6h-6"/><path d="M20.49 15a9 9 0 1 1-2.12-9.36L23 10"/></symbol>
+      <symbol id="i-flip" viewBox="0 0 24 24"><path d="M12 3v18"/><path d="M8 7L3 17h5z"/><path d="M16 7l5 10h-5z"/></symbol>
+      <symbol id="i-crop" viewBox="0 0 24 24"><path d="M6.13 1L6 16a2 2 0 0 0 2 2h15"/><path d="M1 6.13L16 6a2 2 0 0 1 2 2v15"/></symbol>
+      <symbol id="i-magic" viewBox="0 0 24 24"><path d="M15 4V2M15 16v-2M8 9h2M20 9h2M17.8 11.8L19 13M17.8 6.2L19 5M3 21l9-9M12.2 6.2L11 5"/></symbol>
+      <symbol id="i-tune" viewBox="0 0 24 24"><path d="M4 21v-7M4 10V3M12 21v-9M12 8V3M20 21v-5M20 12V3M1 14h6M9 8h6M17 16h6"/></symbol>
+      <symbol id="i-info" viewBox="0 0 24 24"><circle cx="12" cy="12" r="10"/><path d="M12 16v-4M12 8h.01"/></symbol>
+      <symbol id="i-share" viewBox="0 0 24 24"><path d="M4 12v8a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2v-8"/><path d="M16 6l-4-4-4 4"/><path d="M12 2v13"/></symbol>
+      <symbol id="i-trash" viewBox="0 0 24 24"><path d="M3 6h18"/><path d="M19 6l-1 14a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2L5 6"/><path d="M10 11v6M14 11v6"/><path d="M9 6V4a1 1 0 0 1 1-1h4a1 1 0 0 1 1 1v2"/></symbol>
+      <symbol id="i-edit" viewBox="0 0 24 24"><path d="M12 20h9"/><path d="M16.5 3.5a2.12 2.12 0 0 1 3 3L7 19l-4 1 1-4 12.5-12.5z"/></symbol>
+      <symbol id="i-image" viewBox="0 0 24 24"><rect x="3" y="3" width="18" height="18" rx="2"/><circle cx="8.5" cy="8.5" r="1.5"/><path d="M21 15l-5-5L5 21"/></symbol>
+      <symbol id="i-camera" viewBox="0 0 24 24"><path d="M23 19a2 2 0 0 1-2 2H3a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h4l2-3h6l2 3h4a2 2 0 0 1 2 2z"/><circle cx="12" cy="13" r="4"/></symbol>
+      <symbol id="i-layers" viewBox="0 0 24 24"><path d="M12 2L2 7l10 5 10-5-10-5z"/><path d="M2 17l10 5 10-5"/><path d="M2 12l10 5 10-5"/></symbol>
+      <symbol id="i-sparkle" viewBox="0 0 24 24"><path d="M12 3l1.9 5.1L19 10l-5.1 1.9L12 17l-1.9-5.1L5 10l5.1-1.9z"/><path d="M19 16.5l.7 1.8 1.8.7-1.8.7-.7 1.8-.7-1.8-1.8-.7 1.8-.7z"/></symbol>
+      <symbol id="i-compare" viewBox="0 0 24 24"><rect x="3" y="3" width="18" height="18" rx="2"/><path d="M12 3v18"/><path d="M12 5h6a1 1 0 0 1 1 1v12a1 1 0 0 1-1 1h-6z" fill="currentColor" stroke="none"/></symbol>
+      <symbol id="i-check" viewBox="0 0 24 24"><path d="M20 6L9 17l-5-5"/></symbol>
+      <symbol id="i-select" viewBox="0 0 24 24"><path d="M9 11l3 3L22 4"/><path d="M21 12v7a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11"/></symbol>
+      <symbol id="i-details" viewBox="0 0 24 24"><path d="M4 6h16M4 12h16M4 18h10"/></symbol>
+    </defs>
+  </svg>
+
+  <!-- Library -->
+  <section id="view-library" class="view">
+    <header class="topbar">
+      <div class="brand">
+        <svg class="logo" viewBox="0 0 48 48" aria-hidden="true"><rect x="10" y="12" width="28" height="24" rx="3" fill="#8ab4ff"/><path d="M13 32l8-9 6 6 4-4 5 7z" fill="#101114" opacity=".55"/><path d="M4 12V6a2 2 0 0 1 2-2h6M36 4h6a2 2 0 0 1 2 2v6M44 36v6a2 2 0 0 1-2 2h-6M12 44H6a2 2 0 0 1-2-2v-6" stroke="#e8eaed" stroke-width="3" fill="none" stroke-linecap="round"/></svg>
+        <h1>Scan</h1>
+        <span id="lib-count" class="muted"></span>
+      </div>
+      <div class="actions">
+        <button id="btn-select" class="icon-btn" aria-label="Select" title="Select"><svg class="icon"><use href="#i-select"/></svg></button>
+        <button id="btn-settings" class="icon-btn" aria-label="Settings" title="Settings"><svg class="icon"><use href="#i-settings"/></svg></button>
+      </div>
+    </header>
+    <div id="engine" class="engine" hidden></div>
+    <main id="grid" class="grid" aria-label="Your scans"></main>
+    <div id="empty" class="empty" hidden>
+      <svg viewBox="0 0 120 100" class="empty-art" aria-hidden="true">
+        <rect x="22" y="18" width="76" height="60" rx="4" fill="#26282d" stroke="#3c4043" stroke-width="2"/>
+        <path d="M30 70l20-22 14 14 10-10 16 18z" fill="#3c4043"/>
+        <circle cx="80" cy="36" r="7" fill="#8ab4ff"/>
+        <path d="M10 26V12a4 4 0 0 1 4-4h14M92 8h14a4 4 0 0 1 4 4v14M110 70v14a4 4 0 0 1-4 4H92M28 88H14a4 4 0 0 1-4-4V70" stroke="#8ab4ff" stroke-width="3" fill="none" stroke-linecap="round"/>
+      </svg>
+      <h2>Scan your printed photos</h2>
+      <p>Point your camera at a photo. Scan finds the edges, straightens it, and removes glare by combining a few shots from different angles.</p>
+      <button id="btn-empty-scan" class="btn primary">Start scanning</button>
+    </div>
+    <div id="fab-row" class="fab-row">
+      <button id="btn-import" class="btn tonal"><svg class="icon"><use href="#i-image"/></svg>Import</button>
+      <button id="btn-scan" class="btn primary fab"><svg class="icon"><use href="#i-camera"/></svg>Scan photo</button>
+    </div>
+    <div id="select-bar" class="select-bar" hidden>
+      <button id="sel-cancel" class="icon-btn" aria-label="Cancel selection"><svg class="icon"><use href="#i-close"/></svg></button>
+      <span id="sel-count">0 selected</span>
+      <button id="sel-all" class="btn text">All</button>
+      <button id="sel-share" class="icon-btn" aria-label="Share or download" title="Share or download"><svg class="icon"><use href="#i-share"/></svg></button>
+      <button id="sel-delete" class="icon-btn" aria-label="Delete" title="Delete"><svg class="icon"><use href="#i-trash"/></svg></button>
+    </div>
+  </section>
+
+  <!-- Camera -->
+  <section id="view-capture" class="view dark" hidden>
+    <div class="cam-stage">
+      <video id="cam-video" autoplay playsinline muted></video>
+      <canvas id="cam-overlay"></canvas>
+      <div id="cam-flash" class="cam-flash"></div>
+    </div>
+    <div class="cam-top">
+      <button id="cam-close" class="icon-btn glass" aria-label="Close camera"><svg class="icon"><use href="#i-close"/></svg></button>
+      <div class="cam-toggles">
+        <button id="cam-mode" class="chip glass"><svg class="icon"><use href="#i-layers"/></svg><span id="cam-mode-label">Single photo</span></button>
+        <button id="cam-glare" class="chip glass on"><svg class="icon"><use href="#i-sparkle"/></svg><span id="cam-glare-label">Glare removal on</span></button>
+      </div>
+      <button id="cam-torch" class="icon-btn glass" aria-label="Flashlight" hidden><svg class="icon"><use href="#i-torch"/></svg></button>
+    </div>
+    <div class="cam-hint-wrap"><div id="cam-hint" class="cam-hint" hidden></div><div id="cam-progress" class="cam-progress" hidden></div></div>
+    <div class="cam-bottom">
+      <button id="cam-library" class="thumb-btn" aria-label="Back to library"></button>
+      <button id="cam-shutter" class="shutter" aria-label="Scan"></button>
+      <div class="cam-side">
+        <button id="cam-done" class="btn glass" hidden>Done</button>
+        <button id="cam-import" class="icon-btn glass" aria-label="Import from gallery"><svg class="icon"><use href="#i-image"/></svg></button>
+      </div>
+    </div>
+  </section>
+
+  <!-- Review (several photos from one page) -->
+  <section id="view-review" class="view" hidden>
+    <header class="topbar">
+      <button id="rv-back" class="icon-btn" aria-label="Back"><svg class="icon"><use href="#i-back"/></svg></button>
+      <h1 id="rv-title" class="title">Photos found</h1>
+      <button id="rv-save-all" class="btn primary">Save all</button>
+    </header>
+    <p class="muted pad">Tap a photo to adjust it, or save them all as they are.</p>
+    <main id="rv-grid" class="rv-grid"></main>
+  </section>
+
+  <!-- Editor -->
+  <section id="view-editor" class="view dark" hidden>
+    <header class="topbar">
+      <button id="ed-back" class="icon-btn" aria-label="Back"><svg class="icon"><use href="#i-back"/></svg></button>
+      <h1 id="ed-title" class="title">New scan</h1>
+      <button id="ed-save" class="btn primary"><svg class="icon"><use href="#i-check"/></svg>Save</button>
+    </header>
+    <div id="ed-stage" class="ed-stage">
+      <canvas id="ed-canvas"></canvas>
+      <canvas id="ed-compare-canvas" hidden></canvas>
+      <canvas id="ed-crop" hidden></canvas>
+      <div id="ed-spinner" class="spinner small" hidden></div>
+      <button id="ed-compare" class="icon-btn glass float" aria-label="Hold to compare with the original" title="Hold to compare"><svg class="icon"><use href="#i-compare"/></svg></button>
+    </div>
+    <div class="ed-panels">
+      <div class="ed-panel" data-panel="crop" hidden>
+        <p class="muted">Drag the corners onto the photo's edges.</p>
+        <div class="row">
+          <button id="crop-auto" class="btn tonal">Auto-detect</button>
+          <button id="crop-full" class="btn tonal">Whole image</button>
+          <button id="crop-apply" class="btn primary">Apply</button>
+        </div>
+      </div>
+      <div class="ed-panel" data-panel="rotate" hidden>
+        <div class="row center">
+          <button id="rot-left" class="btn tonal"><svg class="icon"><use href="#i-rot-left"/></svg>Left</button>
+          <button id="rot-right" class="btn tonal"><svg class="icon"><use href="#i-rot-right"/></svg>Right</button>
+          <button id="rot-flip" class="btn tonal"><svg class="icon"><use href="#i-flip"/></svg>Mirror</button>
+        </div>
+      </div>
+      <div class="ed-panel" data-panel="enhance">
+        <div id="preset-chips" class="chips"></div>
+        <div id="enhance-sliders"></div>
+      </div>
+      <div class="ed-panel" data-panel="adjust" hidden>
+        <div id="adjust-sliders"></div>
+        <div class="row end"><button id="adj-reset" class="btn text">Reset</button></div>
+      </div>
+      <div class="ed-panel" data-panel="details" hidden>
+        <label class="field"><span>When was the photo taken?</span>
+          <input id="meta-date" type="text" inputmode="numeric" autocomplete="off" placeholder="e.g. 1987 or 1987-06-14">
+          <small id="meta-date-hint" class="muted">Photo apps will sort the scan under this date</small></label>
+        <label class="field"><span>Caption</span>
+          <textarea id="meta-caption" rows="2" placeholder="Who, where, what…"></textarea></label>
+        <p id="meta-info" class="muted small"></p>
+      </div>
+    </div>
+    <nav class="ed-tabs">
+      <button data-tab="crop"><svg class="icon"><use href="#i-crop"/></svg><span>Crop</span></button>
+      <button data-tab="rotate"><svg class="icon"><use href="#i-rot-right"/></svg><span>Rotate</span></button>
+      <button data-tab="enhance" class="on"><svg class="icon"><use href="#i-magic"/></svg><span>Enhance</span></button>
+      <button data-tab="adjust"><svg class="icon"><use href="#i-tune"/></svg><span>Adjust</span></button>
+      <button data-tab="details"><svg class="icon"><use href="#i-details"/></svg><span>Details</span></button>
+    </nav>
+  </section>
+
+  <!-- Viewer -->
+  <section id="view-viewer" class="view dark" hidden>
+    <header class="topbar">
+      <button id="vw-back" class="icon-btn" aria-label="Back"><svg class="icon"><use href="#i-back"/></svg></button>
+      <div class="actions">
+        <button id="vw-info" class="icon-btn" aria-label="Details" title="Details"><svg class="icon"><use href="#i-info"/></svg></button>
+        <button id="vw-edit" class="icon-btn" aria-label="Edit" title="Edit"><svg class="icon"><use href="#i-edit"/></svg></button>
+        <button id="vw-delete" class="icon-btn" aria-label="Delete" title="Delete"><svg class="icon"><use href="#i-trash"/></svg></button>
+        <button id="vw-share" class="btn primary"><svg class="icon"><use href="#i-share"/></svg>Save / Share</button>
+      </div>
+    </header>
+    <div id="vw-stage" class="vw-stage">
+      <img id="vw-img" alt="Scanned photo">
+      <button id="vw-prev" class="icon-btn glass nav prev" aria-label="Previous"><svg class="icon"><use href="#i-chev-left"/></svg></button>
+      <button id="vw-next" class="icon-btn glass nav next" aria-label="Next"><svg class="icon"><use href="#i-chev-right"/></svg></button>
+    </div>
+    <div id="vw-info-panel" class="sheet" hidden>
+      <label class="field"><span>When was the photo taken?</span>
+        <input id="vw-date" type="text" inputmode="numeric" autocomplete="off" placeholder="e.g. 1987 or 1987-06-14"></label>
+      <label class="field"><span>Caption</span><textarea id="vw-caption" rows="2"></textarea></label>
+      <p id="vw-details" class="muted small"></p>
+      <div class="row end"><button id="vw-save-meta" class="btn primary">Save details</button></div>
+    </div>
+  </section>
+
+  <!-- Settings -->
+  <dialog id="settings" class="dialog">
+    <h2>Settings</h2>
+    <div class="settings-list">
+      <label class="setting"><div><b>Glare removal</b><small>Take 4 extra shots from slightly different angles, like Google PhotoScan.</small></div>
+        <input type="checkbox" class="switch" data-setting="glare"></label>
+      <label class="setting"><div><b>Look for new scans</b><small>Can be changed per photo in the editor.</small></div>
+        <select data-setting="preset"><option value="none">Original</option><option value="auto">Auto</option><option value="restore">Restore faded</option><option value="bw">Black &amp; white</option></select></label>
+      <label class="setting"><div><b>Auto-rotate</b><small>Turn sideways photos upright by finding faces.</small></div>
+        <input type="checkbox" class="switch" data-setting="autoRotate"></label>
+      <label class="setting"><div><b>Save without reviewing</b><small>Store each camera scan right away and keep scanning. Edit later from the library.</small></div>
+        <input type="checkbox" class="switch" data-setting="autoSave"></label>
+      <label class="setting"><div><b>Snap to print sizes</b><small>Make 4×6, 5×7, square and other standard prints exactly the right shape.</small></div>
+        <input type="checkbox" class="switch" data-setting="snap"></label>
+      <label class="setting"><div><b>Saved image size</b><small>Longest side. Actual size is limited by your camera.</small></div>
+        <select data-setting="outputMax"><option value="2400">2400 px</option><option value="3200">3200 px</option><option value="4800">4800 px</option></select></label>
+      <label class="setting"><div><b>JPEG quality</b></div>
+        <select data-setting="quality"><option value="0.85">Good (smaller)</option><option value="0.92">High</option><option value="0.97">Best (larger)</option></select></label>
+      <label class="setting"><div><b>Camera resolution</b><small>Use Standard if scanning feels slow on your phone.</small></div>
+        <select data-setting="camera"><option value="high">High (up to 4K)</option><option value="standard">Standard (1080p)</option></select></label>
+      <label class="setting"><div><b>Default sharpening</b></div>
+        <select data-setting="sharpen"><option value="0">Off</option><option value="25">Light</option><option value="50">Medium</option></select></label>
+    </div>
+    <p id="storage-info" class="muted small"></p>
+    <p class="muted small">Everything happens on this device. Photos are stored in this browser only, so save or share the ones you want to keep elsewhere.</p>
+    <div class="row between">
+      <button id="settings-delete-all" class="btn text danger">Delete all scans</button>
+      <button id="settings-close" class="btn primary">Done</button>
+    </div>
+  </dialog>
+
+  <dialog id="confirm" class="dialog small">
+    <p id="confirm-text"></p>
+    <div class="row end">
+      <button id="confirm-cancel" class="btn text">Cancel</button>
+      <button id="confirm-ok" class="btn primary">OK</button>
+    </div>
+  </dialog>
+
+  <div id="busy" class="busy" hidden>
+    <div class="busy-card">
+      <div class="spinner"></div>
+      <p id="busy-text">Working…</p>
+      <div class="bar" hidden><div id="busy-bar"></div></div>
+    </div>
+  </div>
+  <div id="toast" class="toast" role="status" aria-live="polite"></div>
+  <input id="file-input" type="file" accept="image/*" multiple hidden>
+</body>
+</html>

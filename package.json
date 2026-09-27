@@ -1,0 +1,13 @@
+{
+  "name": "scan",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Scan printed photos with your phone: automatic cropping, glare removal and colour restoration.",
+  "scripts": {
+    "test": "node --test tests/*.test.mjs",
+    "start": "python3 -m http.server 8000"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}
