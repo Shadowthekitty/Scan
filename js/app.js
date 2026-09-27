@@ -9,6 +9,7 @@ import { defaultParams, saveDoc } from './saver.js';
 import { getScan, requestPersistence, storageEstimate, listScans, deleteScan } from './db.js';
 
 const VIEWS = ['library', 'capture', 'review', 'editor', 'viewer'];
+export const APP_VERSION = '1.1';
 
 class App {
   constructor() {
@@ -285,7 +286,7 @@ class App {
     });
     const est = await storageEstimate();
     const scans = await listScans().catch(() => []);
-    $('#storage-info').textContent = `${scans.length} scan${scans.length === 1 ? '' : 's'}` +
+    $('#storage-info').textContent = `Version ${APP_VERSION} · ${scans.length} scan${scans.length === 1 ? '' : 's'}` +
       (est ? ` · ${formatBytes(est.usage)} used of ${formatBytes(est.quota)} available` : '');
     $('#settings-delete-all').onclick = async () => {
       if (!scans.length) return;
@@ -303,6 +304,10 @@ class App {
 window.addEventListener('DOMContentLoaded', () => {
   window.app = new App();
   if ('serviceWorker' in navigator && location.protocol !== 'file:') {
+    const hadController = !!navigator.serviceWorker.controller;
+    navigator.serviceWorker.addEventListener('controllerchange', () => {
+      if (hadController) toast('Scan was updated. Close and reopen the app to use the new version.', 6000);
+    });
     navigator.serviceWorker.register('sw.js').catch(() => {});
   }
 });

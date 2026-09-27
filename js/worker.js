@@ -83,11 +83,11 @@ function cmdDetect({ image, multi }) {
   }
 }
 
-function cmdTrackStart({ image }) {
+function cmdTrackStart({ image, quad }) {
   if (tracker) { tracker.delete(); tracker = null; }
   const g = smallGray(image);
   try {
-    tracker = P.createTracker(g);
+    tracker = P.createTracker(g, quad);
     return { features: tracker.f.pts.length / 2 };
   } finally {
     g.delete();
@@ -99,7 +99,7 @@ function cmdTrack({ image }) {
   const g = smallGray(image);
   try {
     const r = P.trackFrame(tracker, g);
-    return r ? { H: r.H, inliers: r.inliers } : null;
+    return r ? { H: r.H, inliers: r.inliers, mode: r.mode } : null;
   } finally {
     g.delete();
   }

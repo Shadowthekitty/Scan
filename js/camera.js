@@ -94,6 +94,45 @@ export class Camera {
     return { width: w, height: h, data: img.data };
   }
 
+  /**
+   * Frame for tracking during the guided shots. Sized by the short side so
+   * a phone held upright (portrait video) still gives enough detail.
+   */
+  grabTrack(short = 320, long = 640) {
+    const vw = this.width, vh = this.height;
+    if (!vw) return null;
+    const k = Math.min(1, short / Math.min(vw, vh), long / Math.max(vw, vh));
+    return this.grabSmall(Math.round(Math.max(vw, vh) * k));
+  }
+
+  /**
+   * How much the picture changed since the last call (0-255 scale), from a
+   * tiny thumbnail. Uniform brightness changes (auto-exposure) are ignored.
+   */
+  motion() {
+    const vw = this.width, vh = this.height;
+    if (!vw) return Infinity;
+    const w = 48, h = Math.max(8, Math.round(48 * vh / vw));
+    if (!this.tiny) {
+      this.tiny = document.createElement('canvas');
+      this.tinyCtx = this.tiny.getContext('2d', { willReadFrequently: true });
+    }
+    if (this.tiny.width !== w || this.tiny.height !== h) { this.tiny.width = w; this.tiny.height = h; this.tinyPrev = null; }
+    this.tinyCtx.drawImage(this.video, 0, 0, w, h);
+    const d = this.tinyCtx.getImageData(0, 0, w, h).data;
+    const g = new Float32Array(w * h);
+    for (let i = 0, o = 0; i < g.length; i++, o += 4) g[i] = 0.299 * d[o] + 0.587 * d[o + 1] + 0.114 * d[o + 2];
+    const prev = this.tinyPrev;
+    this.tinyPrev = g;
+    if (!prev) return Infinity;
+    let mean = 0;
+    for (let i = 0; i < g.length; i++) mean += g[i] - prev[i];
+    mean /= g.length;
+    let diff = 0;
+    for (let i = 0; i < g.length; i++) diff += Math.abs(g[i] - prev[i] - mean);
+    return diff / g.length;
+  }
+
   /** Full-resolution frame. */
   grabFull() {
     const vw = this.width, vh = this.height;

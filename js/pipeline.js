@@ -500,13 +500,13 @@
   /* Features, tracking and alignment                                    */
   /* ------------------------------------------------------------------ */
 
-  function orbFeatures(gray, n) {
+  function orbFeatures(gray, n, mask) {
     const orb = new cv.ORB(n, 1.2, 8, 31, 0, 2, cv.ORB_HARRIS_SCORE, 31, 12);
     const kp = new cv.KeyPointVector();
     const desc = new cv.Mat();
-    const noMask = new cv.Mat();
+    const noMask = mask || new cv.Mat();
     orb.detectAndCompute(gray, noMask, kp, desc);
-    noMask.delete();
+    if (!mask) noMask.delete();
     orb.delete();
     const pts = new Float32Array(kp.size() * 2);
     for (let i = 0; i < kp.size(); i++) {
@@ -567,23 +567,328 @@
     return ratio > 0.15 && ratio < 6;
   }
 
-  /** Tracker for the guided glare-removal capture. Works on small frames. */
-  function createTracker(refGray) {
-    const f = orbFeatures(refGray, 900);
-    return { f, w: refGray.cols, h: refGray.rows, delete() { f.delete(); } };
+  /* Tracking for the guided glare-removal shots.
+   *
+   * Points are followed from frame to frame with pyramidal Lucas-Kanade
+   * flow (forward-backward checked). Each point remembers where it sits in
+   * the reference frame, so the reference->current homography is fitted
+   * directly and does not accumulate error. Every few frames, and whenever
+   * flow fails, ORB matching against the reference re-anchors the track.
+   * Blown-out glare moves with the camera, not the photo, so it is masked
+   * out of feature detection.
+   */
+
+  // 255 where features may be used, 0 on and around blown-out highlights.
+  function usableMask(gray) {
+    const m = new cv.Mat();
+    cv.threshold(gray, m, 242, 255, cv.THRESH_BINARY_INV);
+    const r = Math.max(2, Math.round(Math.min(gray.cols, gray.rows) * 0.025));
+    const k = cv.getStructuringElement(cv.MORPH_ELLIPSE, new cv.Size(2 * r + 1, 2 * r + 1));
+    cv.erode(m, m, k);
+    k.delete();
+    return m;
   }
 
-  /** Returns { H: ref->current (3x3 array), inliers } or null. */
-  function trackFrame(tracker, gray) {
-    const f = orbFeatures(gray, 700);
+  function goodCorners(gray, mask, max, minDist) {
+    const det = new cv.GFTTDetector(max, 0.01, minDist, 3, false, 0.04);
+    const kp = new cv.KeyPointVector();
+    det.detect(gray, kp, mask);
+    const out = new Float32Array(kp.size() * 2);
+    for (let i = 0; i < kp.size(); i++) {
+      const p = kp.get(i).pt;
+      out[i * 2] = p.x; out[i * 2 + 1] = p.y;
+    }
+    kp.delete();
+    det.delete();
+    return out;
+  }
+
+  // Frame used for optical flow. A high-pass version was tried to suppress
+  // glare veils, but it amplified noise and tracked worse on soft photos.
+  function flowImage(gray) {
+    return copyMat(gray);
+  }
+
+  // Tuned with tests/handheld.mjs (simulated phone: 4 tracked frames per
+  // second, hand shake, motion blur, moving glare, exposure drift).
+  const TRACKING = { maxPoints: 320, win: 21, levels: 4, maxKeyframes: 8 };
+
+  // Restrict a feature mask to the photo (plus a small margin). Tables and
+  // cloths are often plain or repetitive, which breeds false matches.
+  function limitToPhoto(mask, quad) {
+    if (!quad) return;
+    const c = centroid(quad);
+    const grown = quad.map((p) => [c[0] + (p[0] - c[0]) * 1.08, c[1] + (p[1] - c[1]) * 1.08]);
+    const poly = new cv.Mat(mask.rows, mask.cols, cv.CV_8UC1, new cv.Scalar(0));
+    const pts = cv.matFromArray(4, 1, cv.CV_32SC2, grown.flat().map(Math.round));
+    cv.fillConvexPoly(poly, pts, new cv.Scalar(255));
+    cv.bitwise_and(mask, poly, mask);
+    poly.delete(); pts.delete();
+  }
+
+  function keyframeFeatures(gray, quad) {
+    const mask = usableMask(gray);
+    const full = cv.countNonZero(mask);
+    limitToPhoto(mask, quad);
+    // Fall back to the whole frame if the photo region is too small.
+    if (quad && cv.countNonZero(mask) < full * 0.15) { mask.delete(); return keyframeFeatures(gray, null); }
+    const f = orbFeatures(gray, 900, mask);
+    mask.delete();
+    return f;
+  }
+
+  /**
+   * refGray: small grey reference frame. photoQuad (optional): the photo's
+   * corners in that frame, used to prefer features on the print itself.
+   */
+  function createTracker(refGray, photoQuad) {
+    const quad = photoQuad && photoQuad.length === 4 && isConvexQuad(photoQuad) ? photoQuad : null;
+    const f = keyframeFeatures(refGray, quad);
+    const mask = usableMask(refGray);
+    const minDist = Math.max(6, Math.round(Math.min(refGray.cols, refGray.rows) / 45));
+    const hp = flowImage(refGray);
+    const pts = goodCorners(hp, mask, TRACKING.maxPoints, minDist);
+    mask.delete();
+    const I = [1, 0, 0, 0, 1, 0, 0, 0, 1];
+    const tr = {
+      f,
+      w: refGray.cols,
+      h: refGray.rows,
+      minDist,
+      prev: hp,
+      cur: pts,
+      ref: pts.slice(),
+      sinceCheck: 0,
+      missed: 0,
+      H: I,
+      // Views of the photo with known pose, used to find it again after
+      // tracking is lost far away from the first shot.
+      quad,
+      keyframes: [{ f, H: I, c: [refGray.cols / 2, refGray.rows / 2], gray: copyMat(refGray) }],
+      delete() {
+        tr.keyframes.forEach((k) => { k.f.delete(); k.gray.delete(); });
+        if (!tr.prev.isDeleted()) tr.prev.delete();
+      },
+    };
+    return tr;
+  }
+
+  // Frame centre expressed in reference coordinates.
+  function viewCentre(tr, H) {
+    const Hi = inv3(H);
+    return Hi ? applyH(Hi, [tr.w / 2, tr.h / 2]) : [Infinity, Infinity];
+  }
+
+  function flowStep(tr, gray) {
+    const n = tr.cur.length / 2;
+    if (n < 12) return null;
+    const s = scope();
     try {
-      const { a, b } = matchPairs(tracker.f, f, 0.8);
-      const r = homographyFromPairs(a, b, 4);
-      if (!r || r.inliers < 18 || !homographySane(r.H, tracker.w, tracker.h)) return null;
-      return r;
+      const p0 = s(cv.matFromArray(n, 1, cv.CV_32FC2, Array.from(tr.cur)));
+      const p1 = s(new cv.Mat()), back = s(new cv.Mat());
+      const st1 = s(new cv.Mat()), st2 = s(new cv.Mat()), e1 = s(new cv.Mat()), e2 = s(new cv.Mat());
+      const crit = new cv.TermCriteria(cv.TermCriteria_COUNT + cv.TermCriteria_EPS, 20, 0.03);
+      const win = new cv.Size(TRACKING.win, TRACKING.win);
+      cv.calcOpticalFlowPyrLK(tr.prev, gray, p0, p1, st1, e1, win, TRACKING.levels, crit);
+      cv.calcOpticalFlowPyrLK(gray, tr.prev, p1, back, st2, e2, win, TRACKING.levels, crit);
+      const a = [], b = [];
+      const P0 = tr.cur, P1 = p1.data32F, PB = back.data32F, S1 = st1.data, S2 = st2.data;
+      for (let i = 0; i < n; i++) {
+        if (!S1[i] || !S2[i]) continue;
+        const fb = Math.hypot(PB[i * 2] - P0[i * 2], PB[i * 2 + 1] - P0[i * 2 + 1]);
+        if (fb > 1.0) continue;
+        const x = P1[i * 2], y = P1[i * 2 + 1];
+        if (x < 0 || y < 0 || x >= tr.w || y >= tr.h) continue;
+        a.push(tr.ref[i * 2], tr.ref[i * 2 + 1]);
+        b.push(x, y);
+      }
+      const m = a.length / 2;
+      if (m < 15) return null;
+      const A = s(cv.matFromArray(m, 1, cv.CV_32FC2, a));
+      const B = s(cv.matFromArray(m, 1, cv.CV_32FC2, b));
+      const inl = s(new cv.Mat());
+      const Hm = s(cv.findHomography(A, B, cv.RANSAC, 3, inl, 1000, 0.995));
+      if (Hm.empty()) return null;
+      const H = Array.from(Hm.data64F);
+      const cur = [], ref = [];
+      for (let k = 0; k < m; k++) {
+        if (!inl.data[k]) continue;
+        cur.push(b[k * 2], b[k * 2 + 1]);
+        ref.push(a[k * 2], a[k * 2 + 1]);
+      }
+      const inliers = cur.length / 2;
+      // A few points that agree by chance must not win over the rest.
+      if (inliers < 15 || inliers < m * 0.35 || !homographySane(H, tr.w, tr.h)) return null;
+      return { H, cur: Float32Array.from(cur), ref: Float32Array.from(ref), inliers };
+    } finally {
+      s.free();
+    }
+  }
+
+  // Find the photo by matching against stored keyframes, nearest first.
+  /**
+   * Check a keyframe->current homography by overlaying the keyframe on the
+   * current frame and correlating the pictures (at half size, ignoring blown
+   * highlights). Feature matches can agree on a wrong answer on repetitive
+   * textures; the pixels do not.
+   */
+  function overlapScore(kfGray, gray, Hrel, quadInKf) {
+    const s = scope();
+    try {
+      const k = 0.5;
+      const a = s(new cv.Mat()), b = s(new cv.Mat());
+      cv.resize(kfGray, a, new cv.Size(0, 0), k, k, cv.INTER_AREA);
+      cv.resize(gray, b, new cv.Size(0, 0), k, k, cv.INTER_AREA);
+      const Hh = mul3(mul3(scaleMat(k), Hrel), scaleMat(1 / k));
+      const M = s(matFromH(Hh));
+      const warped = s(new cv.Mat());
+      cv.warpPerspective(a, warped, M, new cv.Size(b.cols, b.rows), cv.INTER_LINEAR, cv.BORDER_CONSTANT, new cv.Scalar(0));
+      // Region: the photo if known, else the whole keyframe.
+      const region = s(new cv.Mat(a.rows, a.cols, cv.CV_8UC1, new cv.Scalar(quadInKf ? 0 : 255)));
+      if (quadInKf) {
+        const pts = s(cv.matFromArray(4, 1, cv.CV_32SC2, quadInKf.flat().map((v) => Math.round(v * k))));
+        cv.fillConvexPoly(region, pts, new cv.Scalar(255));
+      }
+      const valid = s(new cv.Mat());
+      cv.warpPerspective(region, valid, M, new cv.Size(b.cols, b.rows), cv.INTER_NEAREST, cv.BORDER_CONSTANT, new cv.Scalar(0));
+      const A = warped.data, B = b.data, V = valid.data;
+      let n = 0, sa = 0, sb = 0;
+      for (let i = 0; i < V.length; i++) {
+        if (!V[i] || A[i] > 242 || B[i] > 242 || A[i] < 3) continue;
+        n++; sa += A[i]; sb += B[i];
+      }
+      if (n < V.length * 0.08) return 0;
+      const ma = sa / n, mb = sb / n;
+      let cab = 0, caa = 0, cbb = 0;
+      for (let i = 0; i < V.length; i++) {
+        if (!V[i] || A[i] > 242 || B[i] > 242 || A[i] < 3) continue;
+        const da = A[i] - ma, db = B[i] - mb;
+        cab += da * db; caa += da * da; cbb += db * db;
+      }
+      return caa > 0 && cbb > 0 ? cab / Math.sqrt(caa * cbb) : 0;
+    } finally {
+      s.free();
+    }
+  }
+
+  // Find the photo by matching against stored keyframes, nearest first.
+  function relocalise(tr, gray, near, maxJump) {
+    const mask = usableMask(gray);
+    const f = orbFeatures(gray, 800, mask);
+    mask.delete();
+    try {
+      const order = tr.keyframes.slice().sort((p, q) =>
+        Math.hypot(p.c[0] - near[0], p.c[1] - near[1]) - Math.hypot(q.c[0] - near[0], q.c[1] - near[1]));
+      let best = null;
+      for (const kf of order.slice(0, 3)) {
+        const { a, b } = matchPairs(kf.f, f, 0.8);
+        const r = homographyFromPairs(a, b, 4);
+        if (!r || r.inliers < 20 || r.inliers < r.total * 0.2) continue;
+        const H = mul3(r.H, kf.H);
+        if (!homographySane(H, tr.w, tr.h)) continue;
+        const c = viewCentre(tr, H);
+        const jump = Math.hypot(c[0] - near[0], c[1] - near[1]);
+        const strong = r.inliers >= 80 && r.inliers >= r.total * 0.4;
+        if (jump > maxJump && !strong) continue;
+        const quadInKf = tr.quad ? tr.quad.map((p) => applyH(kf.H, p)) : null;
+        const score = overlapScore(kf.gray, gray, r.H, quadInKf);
+        if (score < 0.5) continue;
+        const rank = r.inliers * score;
+        if (!best || rank > best.rank) best = { H, inliers: r.inliers, ratio: r.inliers / r.total, score, rank };
+      }
+      return best;
     } finally {
       f.delete();
     }
+  }
+
+  function maybeAddKeyframe(tr, gray, H) {
+    const c = viewCentre(tr, H);
+    const minGap = Math.min(tr.w, tr.h) * 0.22;
+    if (tr.keyframes.some((k) => Math.hypot(k.c[0] - c[0], k.c[1] - c[1]) < minGap)) return;
+    const f = keyframeFeatures(gray, tr.quad ? tr.quad.map((p) => applyH(H, p)) : null);
+    if (f.pts.length < 150) { f.delete(); return; }
+    tr.keyframes.push({ f, H, c, gray: copyMat(gray) });
+    if (tr.keyframes.length > TRACKING.maxKeyframes) {
+      const old = tr.keyframes.splice(1, 1)[0];
+      old.f.delete(); old.gray.delete();
+    }
+  }
+
+  // Add fresh corners from the current frame, placed in the reference via H^-1.
+  function replenish(tr, gray, hp, H, reset) {
+    const Hinv = inv3(H);
+    if (!Hinv) return;
+    const cur = reset ? [] : Array.from(tr.cur);
+    const ref = reset ? [] : Array.from(tr.ref);
+    const need = TRACKING.maxPoints - cur.length / 2;
+    if (need < 40) return;
+    const mask = usableMask(gray);
+    // Keep new corners away from points that are already tracked.
+    const r = Math.round(tr.minDist);
+    for (let i = 0; i < cur.length; i += 2) cv.circle(mask, new cv.Point(cur[i], cur[i + 1]), r, new cv.Scalar(0), -1);
+    const pts = goodCorners(hp, mask, need, tr.minDist);
+    mask.delete();
+    for (let i = 0; i < pts.length; i += 2) {
+      const q = applyH(Hinv, [pts[i], pts[i + 1]]);
+      if (!(q[0] > -tr.w * 0.5 && q[1] > -tr.h * 0.5 && q[0] < tr.w * 1.5 && q[1] < tr.h * 1.5)) continue;
+      cur.push(pts[i], pts[i + 1]);
+      ref.push(q[0], q[1]);
+    }
+    tr.cur = Float32Array.from(cur);
+    tr.ref = Float32Array.from(ref);
+  }
+
+  /** Returns { H: ref->current (3x3 array), inliers, mode } or null when lost. */
+  function trackFrame(tr, gray) {
+    let result = null;
+    let reset = false;
+    const hp = flowImage(gray);
+    const flow = flowStep(tr, hp);
+    if (flow) result = { H: flow.H, inliers: flow.inliers, mode: 'flow' };
+    tr.sinceCheck++;
+    // Re-anchor every few frames, and immediately when flow support is thin.
+    if (!result || tr.sinceCheck >= 6 || result.inliers < 30) {
+      tr.sinceCheck = 0;
+      const last = viewCentre(tr, tr.H);
+      // The phone can only move so far between updates; allow more the
+      // longer tracking has been lost.
+      const maxJump = Math.min(tr.w, tr.h) * (0.3 + 0.25 * tr.missed);
+      const orb = relocalise(tr, gray, last, maxJump);
+      if (orb) {
+        if (!result) {
+          result = { H: orb.H, inliers: orb.inliers, mode: 'orb' };
+          reset = true;
+        } else if (orb.inliers >= Math.min(40, Math.max(22, result.inliers))) {
+          // Correct slow drift when the anchored estimate clearly disagrees.
+          const probe = [[tr.w * 0.25, tr.h * 0.25], [tr.w * 0.75, tr.h * 0.25], [tr.w * 0.75, tr.h * 0.75], [tr.w * 0.25, tr.h * 0.75]];
+          const dev = Math.max(...probe.map((p) => {
+            const u = applyH(result.H, p), v = applyH(orb.H, p);
+            return Math.hypot(u[0] - v[0], u[1] - v[1]);
+          }));
+          if (dev > Math.min(tr.w, tr.h) * 0.03) {
+            result = { H: orb.H, inliers: orb.inliers, mode: 'orb' };
+            reset = true;
+          }
+        }
+      }
+    }
+    if (!result) {
+      // Keep the last good frame and points: flow can often bridge a
+      // missed frame. Give them up only after several misses.
+      tr.missed++;
+      if (tr.missed > 3) { tr.cur = new Float32Array(0); tr.ref = new Float32Array(0); }
+      hp.delete();
+      return null;
+    }
+    tr.missed = 0;
+    if (flow && !reset) { tr.cur = flow.cur; tr.ref = flow.ref; }
+    tr.H = result.H;
+    tr.prev.delete();
+    tr.prev = hp;
+    if (reset || tr.cur.length / 2 < TRACKING.maxPoints * 0.6) replenish(tr, gray, hp, result.H, reset);
+    if (result.inliers >= 60) maybeAddKeyframe(tr, gray, result.H);
+    return result;
   }
 
   function sharpness(gray) {
@@ -1278,7 +1583,7 @@
     init, setFaceModel, scope, copyMat, matFromImage, imageFromMat, resizeMax, toGray,
     orderQuad, polyArea, isConvexQuad, quadAngles, pointInQuad, quadIoU, mul3, inv3, applyH,
     scaleMat, translateMat, detectQuads, refineQuad, createTracker, trackFrame, alignFrames,
-    mergeFrames, rectangleAspect, snapRatio, outputSize, rectify, presetCurves, removeDust,
+    mergeFrames, TRACKING, rectangleAspect, snapRatio, outputSize, rectify, presetCurves, removeDust,
     render, detectOrientation, sharpness, homographySane,
   };
 

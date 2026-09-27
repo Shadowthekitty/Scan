@@ -4,8 +4,9 @@ import { $, toast, showBusy, hideBusy, vibrate } from './util.js';
 import { getSettings, setSetting } from './settings.js';
 
 const LIVE_SIZE = 400;
-const TRACK_SIZE = 480;
 const DOT_SPREAD = 0.62;
+// Keep showing the dots this long after tracking drops out.
+const TRACK_GRACE_MS = 1500;
 
 const STAGES = {
   detect: 'Finding the photo…',
@@ -146,11 +147,39 @@ export class CaptureView {
       if (!this.running) return;
       this.raf = requestAnimationFrame(tick);
       this.resizeOverlay();
+      this.updateMotion();
       if (this.state === 'aim') this.maybeDetect();
       else if (this.state === 'guided') this.maybeTrack();
       this.draw();
     };
     this.raf = requestAnimationFrame(tick);
+  }
+
+  // Smoothed picture motion, with an adaptive floor for noisy or dim scenes.
+  updateMotion() {
+    // Sample at roughly camera frame rate; comparing two screen refreshes
+    // that show the same camera frame would read as "no motion".
+    const now = performance.now();
+    if (now - (this.lastMotion || 0) < 60) return;
+    this.lastMotion = now;
+    const m = this.camera.motion();
+    if (!isFinite(m)) return;
+    this.motionLevel = this.motionLevel === undefined ? m : this.motionLevel * 0.5 + m * 0.5;
+    this.motionFloor = Math.min((this.motionFloor || m) * 1.02 + 0.02, this.motionLevel);
+    const steady = this.motionLevel < Math.max(3, this.motionFloor * 2);
+    this.steadyFrames = steady ? (this.steadyFrames || 0) + 1 : 0;
+    if (this.steadyWaiter && (this.steadyFrames >= 3 || performance.now() > this.steadyWaiter.deadline)) {
+      const w = this.steadyWaiter;
+      this.steadyWaiter = null;
+      w.resolve();
+    }
+  }
+
+  get steady() { return (this.steadyFrames || 0) >= 2; }
+
+  // Resolves once the phone has been still for a few frames (or on timeout).
+  waitSteady(maxMs) {
+    return new Promise((resolve) => { this.steadyWaiter = { resolve, deadline: performance.now() + maxMs }; });
   }
 
   resizeOverlay() {
@@ -234,9 +263,11 @@ export class CaptureView {
       const r = this.displayRect();
       const cx = r.x + r.w / 2, cy = r.y + r.h / 2;
       const R = Math.min(r.w, r.h) * 0.085;
-      if (this.trackOk && this.H) {
+      const recent = this.H && (this.trackOk || performance.now() - this.lastTrackOk < TRACK_GRACE_MS);
+      if (recent) {
         const outline = this.guideQuad.map((p) => this.toScreen([applyH(this.H, p)[0] / this.trackW, applyH(this.H, p)[1] / this.trackH]));
-        this.drawQuad(outline, dpr, 0.45);
+        this.drawQuad(outline, dpr, this.trackOk ? 0.45 : 0.2);
+        ctx.globalAlpha = this.trackOk ? 1 : 0.45;
         for (const d of this.dots) {
           if (d.done) continue;
           const q = applyH(this.H, d.p);
@@ -250,6 +281,7 @@ export class CaptureView {
           ctx.fill();
           ctx.shadowBlur = 0;
         }
+        ctx.globalAlpha = 1;
       }
       ctx.beginPath();
       ctx.arc(cx, cy, R, 0, Math.PI * 2);
@@ -326,8 +358,15 @@ export class CaptureView {
 
   async startScan() {
     this.state = 'capturing';
+    // Tapping the button jolts the phone. Wait until it settles so both the
+    // main shot and the tracking reference are sharp.
+    if (!this.steady) {
+      this.hint('Hold still…');
+      await this.waitSteady(1000);
+      if (this.state !== 'capturing') return;
+    }
     const full = this.camera.grabFull();
-    const small = this.camera.grabSmall(TRACK_SIZE);
+    const small = this.camera.grabTrack();
     if (!full || !small) { this.state = 'aim'; return; }
     this.flash();
     vibrate(20);
@@ -339,15 +378,29 @@ export class CaptureView {
       await this.worker.call('sessionAddFrame', { sid, image: full }, { transfer: [full.data.buffer] });
       this.shots = 1;
       if (!getSettings().glare) { this.finish(); return; }
-      await this.worker.call('trackStart', { image: small }, { transfer: [small.data.buffer] });
+      this.trackW = small.width;
+      this.trackH = small.height;
+      this.setupDots();
+      // Only a single photo's outline is passed: it lets the tracker prefer
+      // features on the print over a plain or patterned table.
+      const quad = this.hintQuads.length === 1 ? this.guideQuad : null;
+      await this.worker.call('trackStart', { image: small, quad }, { transfer: [small.data.buffer] });
     } catch (e) {
       toast('Capture failed: ' + e.message);
       this.state = 'aim';
       return;
     }
-    this.trackW = small.width;
-    this.trackH = small.height;
-    // Guide dots sit toward the corners of the photo (or of all photos).
+    this.H = [1, 0, 0, 0, 1, 0, 0, 0, 1];
+    this.trackOk = true;
+    this.lastTrackOk = performance.now();
+    this.state = 'guided';
+    this.setGuidedUi(true);
+    this.updateProgress();
+    this.hint('Move your phone so the circle covers each dot');
+  }
+
+  // Guide dots sit toward the corners of the photo (or of all photos).
+  setupDots() {
     let pts;
     if (this.hintQuads.length === 1) {
       pts = this.hintQuads[0];
@@ -362,14 +415,7 @@ export class CaptureView {
     const px = pts.map((p) => [p[0] * this.trackW, p[1] * this.trackH]);
     const c = [px.reduce((a, p) => a + p[0], 0) / 4, px.reduce((a, p) => a + p[1], 0) / 4];
     this.guideQuad = px;
-    this.dots = px.map((p) => ({ p: [c[0] + (p[0] - c[0]) * DOT_SPREAD, c[1] + (p[1] - c[1]) * DOT_SPREAD], done: false, near: 0 }));
-    this.H = [1, 0, 0, 0, 1, 0, 0, 0, 1];
-    this.trackOk = true;
-    this.lastTrackOk = performance.now();
-    this.state = 'guided';
-    this.setGuidedUi(true);
-    this.updateProgress();
-    this.hint('Move your phone so the circle covers each dot');
+    this.dots = px.map((p) => ({ p: [c[0] + (p[0] - c[0]) * DOT_SPREAD, c[1] + (p[1] - c[1]) * DOT_SPREAD], done: false, near: 0, last: null }));
   }
 
   updateProgress() {
@@ -379,7 +425,7 @@ export class CaptureView {
 
   maybeTrack() {
     if (this.tracking || this.capturingDot) return;
-    const img = this.camera.grabSmall(TRACK_SIZE);
+    const img = this.camera.grabTrack();
     if (!img) return;
     this.tracking = true;
     this.worker.call('track', { image: img }, { transfer: [img.data.buffer] })
@@ -395,7 +441,7 @@ export class CaptureView {
       this.trackOk = false;
       if (now - this.lastTrackOk > 5000) this.hint('Can\'t follow the photo. Tap the button for each extra shot, or tap Done');
       else if (now - this.lastTrackOk > 1200) this.hint('Point back at the photo');
-      this.dots.forEach((d) => { d.near = 0; });
+      this.dots.forEach((d) => { d.near = 0; d.last = null; });
       return;
     }
     if (!this.trackOk) this.hint('Move your phone so the circle covers each dot');
@@ -409,9 +455,13 @@ export class CaptureView {
       if (d.done) continue;
       const q = applyH(this.H, d.p);
       const s = this.toScreen([q[0] / this.trackW, q[1] / this.trackH]);
-      d.near = Math.hypot(s[0] - cx, s[1] - cy) < R * 0.8 ? d.near + 1 : 0;
-      // Two consecutive hits: the phone is roughly steady over the dot.
-      if (d.near >= 2 && !this.capturingDot) {
+      const inside = Math.hypot(s[0] - cx, s[1] - cy) < R;
+      const settled = d.last && Math.hypot(s[0] - d.last[0], s[1] - d.last[1]) < R * 0.6;
+      d.last = s;
+      d.near = inside ? d.near + 1 : 0;
+      // Take the shot once the dot is inside the circle and the phone is
+      // steady, or after it has stayed inside for a few updates anyway.
+      if (inside && ((settled && this.steady) || d.near >= 3) && !this.capturingDot) {
         this.capturingDot = true;
         try {
           await this.addShot();

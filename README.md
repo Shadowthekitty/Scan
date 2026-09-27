@@ -87,9 +87,14 @@ WebAssembly. The steps are:
    channels feed a contour search. Each candidate quadrilateral is scored by
    how well its sides follow real edges. Each side is then refitted to the
    strongest nearby gradient at higher resolution.
-2. **Tracking.** During the guided shots, ORB features on small frames give a
-   homography from the first shot to the live view. That places the dots on
-   the photo and triggers capture.
+2. **Tracking.** During the guided shots, points are followed from frame to
+   frame with optical flow, and each is tied to its place in the first shot,
+   so the photo's position is always fitted directly. Every few frames ORB
+   matching against stored keyframes re-anchors the track. Each re-anchor is
+   verified by overlaying the images, which rejects false matches on patterned
+   tables. Blown-out glare is masked out, and the first shot waits until the
+   phone is steady after you tap. `tests/tracking.test.mjs` checks this on a
+   simulated handheld phone.
 3. **Alignment.** ORB matching with RANSAC, then refinement with pyramidal
    Lucas-Kanade flow, lands each extra shot on the first to about a pixel.
 4. **Glare merge.** Exposure is matched per channel. Glare only adds light, so
