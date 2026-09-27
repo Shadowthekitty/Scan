@@ -224,7 +224,8 @@
       const approx = new cv.Mat();
       cv.approxPolyDP(hull, approx, eps * peri, true);
       const pts = [];
-      for (let i = 0; i < approx.rows; i++) pts.push([approx.data32S[i * 2], approx.data32S[i * 2 + 1]]);
+      const ad = approx.data32S;
+      for (let i = 0; i < approx.rows; i++) pts.push([ad[i * 2], ad[i * 2 + 1]]);
       approx.delete();
       if (pts.length === 4) { hull.delete(); return pts; }
       if (pts.length < 4) break;
@@ -263,6 +264,41 @@
       per.push(tot ? hit / tot : 0);
     }
     return per;
+  }
+
+  // Longest run along each side without edge pixels, as a fraction of the
+  // side. A box drawn across open page has a long gap; a print edge does not.
+  function edgeGaps(edgeMap, quad) {
+    const w = edgeMap.cols, h = edgeMap.rows, d = edgeMap.data;
+    const out = [];
+    for (let k = 0; k < 4; k++) {
+      const a = quad[k], b = quad[(k + 1) % 4];
+      const n = 60;
+      let run = 0, worst = 0;
+      for (let i = 0; i < n; i++) {
+        const t = 0.04 + 0.92 * (i + 0.5) / n;
+        const x = Math.round(a[0] + (b[0] - a[0]) * t), y = Math.round(a[1] + (b[1] - a[1]) * t);
+        const hit = x >= 0 && y >= 0 && x < w && y < h && d[y * w + x];
+        run = hit ? 0 : run + 1;
+        if (run > worst) worst = run;
+      }
+      out.push(worst / n);
+    }
+    return out;
+  }
+
+  // Fraction of quad `a` that lies inside quad `b` (grid sampled).
+  function insideFraction(a, b) {
+    const xs = a.map((p) => p[0]), ys = a.map((p) => p[1]);
+    const x0 = Math.min(...xs), x1 = Math.max(...xs), y0 = Math.min(...ys), y1 = Math.max(...ys);
+    let n = 0, hit = 0;
+    for (let i = 0; i < 24; i++) for (let j = 0; j < 24; j++) {
+      const pt = [x0 + (x1 - x0) * (i + 0.5) / 24, y0 + (y1 - y0) * (j + 0.5) / 24];
+      if (!pointInQuad(pt, a)) continue;
+      n++;
+      if (pointInQuad(pt, b)) hit++;
+    }
+    return n ? hit / n : 0;
   }
 
   /**
@@ -333,7 +369,7 @@
           cv.convexHull(c, hull, false, true);
           const hullArea = cv.contourArea(hull);
           const hullPts = [];
-          for (let j = 0; j < hull.rows; j++) hullPts.push([hull.data32S[j * 2], hull.data32S[j * 2 + 1]]);
+          { const hd = hull.data32S; for (let j = 0; j < hull.rows; j++) hullPts.push([hd[j * 2], hd[j * 2 + 1]]); }
           hull.delete();
           c.delete();
           if (hullArea < minArea) continue;
@@ -382,33 +418,21 @@
         const minSupport = opts.minSupport !== undefined ? opts.minSupport : 0.45;
         chosen = uniq.filter((c) => c.support >= minSupport).slice(0, 1);
       } else {
-        const good = uniq.filter((c) => c.support >= 0.55);
-        const best = good.length ? good[0].score : 0;
-        let kept = [];
-        for (const c of good) {
-          if (c.score < best * 0.3) continue;
-          if (kept.some((k) => quadIoU(k.q, c.q) > 0.2 && !containsQuad(k.q, c.q) && !containsQuad(c.q, k.q))) continue;
-          kept.push(c);
+        // Walls between page and prints: brightness edges without tiny specks.
+        // (Colour edges fire on sensor noise across dark pages.)
+        const walls = s(new cv.Mat());
+        eLow.copyTo(walls);
+        {
+          const wl = s(new cv.Mat()), ws = s(new cv.Mat()), wc = s(new cv.Mat());
+          const nw = cv.connectedComponentsWithStats(walls, wl, ws, wc, 8, cv.CV_32S);
+          const minLen = Math.max(8, Math.round(Math.min(W, H) * 0.03));
+          const keepW = new Uint8Array(nw);
+          const wsd = ws.data32S;
+          for (let i = 1; i < nw; i++) keepW[i] = Math.max(wsd[i * 5 + 2], wsd[i * 5 + 3]) >= minLen ? 1 : 0;
+          const wd = walls.data, wlab = wl.data32S;
+          for (let p = 0; p < wd.length; p++) wd[p] = keepW[wlab[p]] ? 255 : 0;
         }
-        // Resolve containment: album pages and white print borders.
-        let changed = true;
-        while (changed) {
-          changed = false;
-          for (const outer of kept) {
-            const inner = kept.filter((k) => k !== outer && containsQuad(outer.q, k.q));
-            if (inner.length === 0) continue;
-            if (inner.length === 1 && inner[0].area >= outer.area * 0.6) {
-              // A print with a white border: keep the whole print.
-              kept = kept.filter((k) => k !== inner[0]);
-            } else {
-              // A page holding photos: keep the photos.
-              kept = kept.filter((k) => k !== outer);
-            }
-            changed = true;
-            break;
-          }
-        }
-        chosen = kept.slice(0, opts.maxCount || 12);
+        chosen = photosOnPage(small, uniq, support, walls, opts).slice(0, opts.maxCount || 12);
         // Stable reading order: rows top to bottom, then left to right.
         chosen.sort((a, b) => {
           const ca = centroid(a.q), cb = centroid(b.q);
@@ -423,6 +447,358 @@
         support: c.support,
         area: c.area,
       }));
+    } finally {
+      s.free();
+    }
+  }
+
+  /**
+   * Album pages: find every print lying on a (mostly plain) page.
+   *
+   * Edges alone cannot tell a print from a rectangle inside a print (a
+   * window, a TV, a picture frame). Instead the page colour is learned from
+   * flat areas, everything that differs from it is marked, holes are
+   * filled, and each roughly rectangular blob becomes one print. Edge
+   * candidates are only used to sharpen corners and to split prints that
+   * touch each other.
+   */
+  function photosOnPage(small, cands, edgeMap, edgesThin, opts) {
+    const s = scope();
+    try {
+      const W = small.cols, H = small.rows, N = W * H, imgArea = N;
+      const minArea = (opts.minArea !== undefined ? opts.minArea : 0.012) * imgArea;
+      const rgb = s(new cv.Mat());
+      cv.cvtColor(small, rgb, cv.COLOR_RGBA2RGB);
+      const lab = s(new cv.Mat());
+      cv.cvtColor(rgb, lab, cv.COLOR_RGB2Lab);
+      cv.GaussianBlur(lab, lab, new cv.Size(5, 5), 0);
+      const labCh = s(new cv.MatVector());
+      cv.split(lab, labCh);
+      const L = s(labCh.get(0));
+      // Local texture: blurred gradient magnitude of lightness.
+      const gx = s(new cv.Mat()), gy = s(new cv.Mat()), tex = s(new cv.Mat());
+      cv.Sobel(L, gx, cv.CV_32F, 1, 0, 3);
+      cv.Sobel(L, gy, cv.CV_32F, 0, 1, 3);
+      cv.magnitude(gx, gy, tex);
+      cv.blur(tex, tex, new cv.Size(9, 9));
+      const T = tex.data32F, D = lab.data;
+      // 40th percentile of texture, from a histogram (a full sort is slow).
+      const tHist = new Uint32Array(1024);
+      for (let p = 0; p < N; p++) { const b = (T[p] * 4) | 0; tHist[b > 1023 ? 1023 : b]++; }
+      let flatCut = 0;
+      for (let b = 0, acc = 0; b < 1024; b++) { acc += tHist[b]; if (acc >= N * 0.4) { flatCut = (b + 1) / 4; break; } }
+      const texHigh = Math.max(flatCut * 2.5, 12);
+      const k = Math.max(3, Math.round(Math.min(W, H) / 120)) | 1;
+      const kOpen = s(cv.getStructuringElement(cv.MORPH_RECT, new cv.Size(k, k)));
+      // A small close only: a bigger one would bridge narrow gaps between prints.
+      const kClose = s(cv.getStructuringElement(cv.MORPH_RECT, new cv.Size(3, 3)));
+      const margin = 2;
+      const at = (x, y) => {
+        x = Math.round(x); y = Math.round(y);
+        return x >= 0 && y >= 0 && x < W && y < H ? y * W + x : -1;
+      };
+      const scaled = (q, g) => { const c = centroid(q); return q.map((p) => [c[0] + (p[0] - c[0]) * g, c[1] + (p[1] - c[1]) * g]); };
+      const bin = (p) => ((D[p * 3] >> 3) << 10) | ((D[p * 3 + 1] >> 3) << 5) | (D[p * 3 + 2] >> 3);
+      const near = (p, m) => Math.abs((D[p * 3] >> 3) - (m >> 10)) <= 1 && Math.abs((D[p * 3 + 1] >> 3) - ((m >> 5) & 31)) <= 1 && Math.abs((D[p * 3 + 2] >> 3) - (m & 31)) <= 1;
+
+      // Find prints on the background inside `region` (a quad, or the whole
+      // frame). `pageBin` forces the background colour when known.
+      const level = (region, depth, pageBin) => {
+        const inRegion = new Uint8Array(N);
+        if (region) {
+          const m = new cv.Mat(H, W, cv.CV_8UC1, new cv.Scalar(0));
+          const pts = cv.matFromArray(4, 1, cv.CV_32SC2, scaled(region, 0.985).flat().map(Math.round));
+          cv.fillConvexPoly(m, pts, new cv.Scalar(1));
+          inRegion.set(m.data);
+          m.delete(); pts.delete();
+        } else inRegion.fill(1);
+
+        const mode = pageBin;
+        let bl = 0, ba = 0, bb = 0, bn = 0;
+        for (let p = 0; p < N; p++) {
+          if (!inRegion[p] || T[p] > flatCut || !near(p, mode)) continue;
+          bl += D[p * 3]; ba += D[p * 3 + 1]; bb += D[p * 3 + 2]; bn++;
+        }
+        if (!bn) return [];
+        bl /= bn; ba /= bn; bb /= bn;
+
+        // Distance from the background colour. Lightness counts less, since
+        // shading and glare change it smoothly across a page.
+        const dist = new cv.Mat(H, W, cv.CV_8UC1);
+        const dd = dist.data;
+        for (let p = 0; p < N; p++) {
+          const dl = (D[p * 3] - bl) * 0.6, da = D[p * 3 + 1] - ba, db = D[p * 3 + 2] - bb;
+          const v = Math.sqrt(dl * dl + da * da + db * db);
+          dd[p] = v > 255 ? 255 : v;
+        }
+        const fg = new cv.Mat();
+        const otsu = cv.threshold(dist, fg, 0, 255, cv.THRESH_BINARY + cv.THRESH_OTSU);
+        const thr = Math.min(40, Math.max(10, otsu * 0.8));
+        cv.threshold(dist, fg, thr, 255, cv.THRESH_BINARY);
+        cv.morphologyEx(fg, fg, cv.MORPH_OPEN, kOpen);
+        cv.morphologyEx(fg, fg, cv.MORPH_CLOSE, kClose);
+        if (opts.debugPage) opts.debugPage({ depth, bg: [bl, ba, bb], otsu, thr, fg: new Uint8Array(fg.data), dist: new Uint8Array(dist.data), W, H });
+        const F = new Uint8Array(fg.data);
+        // Outside the region counts as "not background".
+        for (let p = 0; p < N; p++) if (!inRegion[p]) F[p] = 255;
+        // Page-like for the ring test: background colour, or background
+        // that is only lighter (a reflection on the page): smooth and with
+        // the same hue.
+        const colour = new Uint8Array(N);
+        {
+          const tMax = Math.max(texHigh * 3, 30), c2 = (thr * 0.6) * (thr * 0.6);
+          for (let idx = 0; idx < N; idx++) {
+            if (!F[idx]) { colour[idx] = 1; continue; }
+            if (!inRegion[idx] || T[idx] > tMax || D[idx * 3] < bl - 5) continue;
+            const da = D[idx * 3 + 1] - ba, db = D[idx * 3 + 2] - bb;
+            if (da * da + db * db < c2) colour[idx] = 1;
+          }
+        }
+        const colourLike = (idx) => colour[idx] === 1;
+        // The page is the large connected stretch of page colour. Thin edge
+        // lines act as walls, so a patch of page-like colour inside a print
+        // (a pale sky, a blurred background) is not mistaken for page.
+        const walls = edgesThin.data;
+        const open = new cv.Mat(H, W, cv.CV_8UC1);
+        const od = open.data;
+        for (let p = 0; p < N; p++) od[p] = colourLike(p) && !walls[p] ? 255 : 0;
+        const plab = new cv.Mat(), pst = new cv.Mat(), pcen = new cv.Mat();
+        const pn = cv.connectedComponentsWithStats(open, plab, pst, pcen, 4, cv.CV_32S);
+        const bigComp = new Uint8Array(pn);
+        const pstd = pst.data32S;
+        for (let i = 1; i < pn; i++) if (pstd[i * 5 + 4] >= N * 0.02) bigComp[i] = 1;
+        // Grow the page a few pixels into neighbouring page-coloured strips,
+        // such as the thin band between a print's edge and its shadow.
+        const big = new cv.Mat(H, W, cv.CV_8UC1);
+        const pl = plab.data32S;
+        let bd = big.data;
+        for (let p = 0; p < N; p++) bd[p] = bigComp[pl[p]] ? 255 : 0;
+        const gr = Math.max(2, Math.round(Math.min(W, H) * 0.009));
+        const gk = cv.getStructuringElement(cv.MORPH_ELLIPSE, new cv.Size(gr * 2 + 1, gr * 2 + 1));
+        cv.dilate(big, big, gk);
+        bd = big.data;
+        const pageMask = new Uint8Array(N);
+        for (let p = 0; p < N; p++) pageMask[p] = bd[p] && colourLike(p) ? 1 : 0;
+        if (opts.debugPageMask) opts.debugPageMask({ W, H, open: new Uint8Array(open.data), page: pageMask });
+        [open, plab, pst, pcen, big, gk].forEach((m) => m.delete());
+        // Ring samples may sit on an edge pixel itself; look one pixel around.
+        const pageLike = (idx) => {
+          if (pageMask[idx]) return true;
+          if (!walls[idx]) return false;
+          const x = idx % W, y = (idx / W) | 0;
+          return (x > 0 && pageMask[idx - 1]) || (x < W - 1 && pageMask[idx + 1]) || (y > 0 && pageMask[idx - W]) || (y < H - 1 && pageMask[idx + W]);
+        };
+
+        // Extra candidates from the filled colour blobs, for prints whose
+        // edges are faint.
+        const blobCands = [];
+        const fgIn = new cv.Mat(H, W, cv.CV_8UC1);
+        const fid = fgIn.data;
+        for (let p = 0; p < N; p++) fid[p] = inRegion[p] && F[p] ? 255 : 0;
+        const labels = new cv.Mat(), stats = new cv.Mat(), cents = new cv.Mat();
+        const nLab = cv.connectedComponentsWithStats(fgIn, labels, stats, cents, 8, cv.CV_32S);
+        const st = stats.data32S, lab32 = labels.data32S;
+        for (let i = 1; i < nLab; i++) {
+          if (st[i * 5 + 4] < minArea) continue;
+          const bx = st[i * 5], by = st[i * 5 + 1], bw = st[i * 5 + 2], bh = st[i * 5 + 3];
+          // Regions reaching two frame edges (the table) are never prints.
+          const edges = (bx <= 1) + (by <= 1) + (bx + bw >= W - 1) + (by + bh >= H - 1);
+          if (edges >= 2) continue;
+          const pts = [];
+          for (let y = by; y < by + bh; y++) for (let x = bx; x < bx + bw; x++) {
+            if (lab32[y * W + x] !== i) continue;
+            if (x === bx || y === by || x === bx + bw - 1 || y === by + bh - 1 ||
+                lab32[y * W + x - 1] !== i || lab32[y * W + x + 1] !== i || lab32[(y - 1) * W + x] !== i || lab32[(y + 1) * W + x] !== i) pts.push(x, y);
+          }
+          if (pts.length < 8) continue;
+          const pm = cv.matFromArray(pts.length / 2, 1, cv.CV_32SC2, pts);
+          const hull = new cv.Mat();
+          cv.convexHull(pm, hull, false, true);
+          const hullPts = [];
+          { const hd = hull.data32S; for (let j = 0; j < hull.rows; j++) hullPts.push([hd[j * 2], hd[j * 2 + 1]]); }
+          pm.delete(); hull.delete();
+          const q = polygonToQuad(hullPts);
+          if (q && isConvexQuad(orderQuad(q))) blobCands.push({ q: orderQuad(q), score: 0.3, support: 0.5, area: 0, blob: true });
+        }
+        [dist, fg, fgIn, labels, stats, cents].forEach((m) => m.delete());
+
+        const inside = (q) => !region || q.every((p) => pointInQuad(p, scaled(region, 1.01)));
+        const pool = cands.filter((c) => c.support >= 0.5 && inside(c.q))
+          .concat(blobCands.filter((b) => !cands.some((c) => c.support >= 0.55 && quadIoU(c.q, b.q) > 0.8)));
+
+        // A print lies on the page: just outside its edge is page colour,
+        // inside is not. Rectangles inside a print (windows, a TV, a frame)
+        // fail this test.
+        const why = (c, reason, extra) => { if (opts.debugEval) opts.debugEval({ q: c.q, blob: !!c.blob, depth, reason, ...extra }); return null; };
+        const evalCand = (c) => {
+          const q = c.q;
+          const qa = polyArea(q);
+          if (qa < minArea || qa > imgArea * 0.85 || !isConvexQuad(q)) return why(c, 'size');
+          if (region && qa > polyArea(region) * 0.9) return why(c, 'region');
+          if (quadAngles(q).some((a) => a < 55 || a > 125)) return why(c, 'angles');
+          const onBorder = q.filter((p) => p[0] <= margin || p[1] <= margin || p[0] >= W - 1 - margin || p[1] >= H - 1 - margin).length;
+          if (onBorder >= 2) return why(c, 'border');
+          // Every side must follow a real edge: this rejects skewed shapes
+          // and boxes drawn around several prints.
+          const sides = edgeSupport(edgeMap, q);
+          if (Math.min(...sides) < 0.55) return why(c, 'support', { sides });
+          const gaps = edgeGaps(edgeMap, q);
+          if (Math.max(...gaps) > 0.45) return why(c, 'gap', { gaps });
+          let ringN = 0, ringPage = 0;
+          const sideRing = [0, 0, 0, 0], sideN = [0, 0, 0, 0];
+          // Look just outside each side (a few pixels, along its outward
+          // normal): close enough to land in narrow gaps between prints.
+          const cq = centroid(q);
+          const offs = [Math.max(2, Math.min(W, H) * 0.008), Math.max(3.5, Math.min(W, H) * 0.017)];
+          for (let e = 0; e < 4; e++) {
+            const a = q[e], b = q[(e + 1) % 4];
+            const len = Math.hypot(b[0] - a[0], b[1] - a[1]) || 1;
+            let nx = -(b[1] - a[1]) / len, ny = (b[0] - a[0]) / len;
+            const mx = (a[0] + b[0]) / 2, my = (a[1] + b[1]) / 2;
+            if ((mx - cq[0]) * nx + (my - cq[1]) * ny < 0) { nx = -nx; ny = -ny; }
+            for (let t = 0.06; t < 0.95; t += 0.03) {
+              const x = a[0] + (b[0] - a[0]) * t, y = a[1] + (b[1] - a[1]) * t;
+              let any = false, seen = false;
+              for (const d of offs) {
+                const idx = at(x + nx * d, y + ny * d);
+                if (idx < 0) continue;
+                seen = true;
+                if (pageLike(idx)) any = true;
+              }
+              if (!seen) continue;
+              ringN++; sideN[e]++;
+              if (any) { ringPage++; sideRing[e]++; }
+            }
+          }
+          if (sideRing.some((v, e) => sideN[e] && v / sideN[e] < 0.3)) return why(c, 'sidering', { sideRing: sideRing.map((v, e) => (v / (sideN[e] || 1)).toFixed(2)) });
+          const inner = scaled(q, 0.85);
+          const xs = inner.map((p) => p[0]), ys = inner.map((p) => p[1]);
+          const x0 = Math.min(...xs), x1 = Math.max(...xs), y0 = Math.min(...ys), y1 = Math.max(...ys);
+          let inN = 0, inPhoto = 0;
+          for (let i = 0; i < 20; i++) for (let j = 0; j < 20; j++) {
+            const pt = [x0 + (x1 - x0) * (i + 0.5) / 20, y0 + (y1 - y0) * (j + 0.5) / 20];
+            if (!pointInQuad(pt, inner)) continue;
+            const idx = at(pt[0], pt[1]);
+            if (idx < 0) continue;
+            inN++;
+            if (!pageMask[idx] || T[idx] > texHigh) inPhoto++;
+          }
+          const ring = ringN ? ringPage / ringN : 0;
+          const ins = inN ? inPhoto / inN : 0;
+          if (ring < 0.6 || ins < 0.3) return why(c, 'ring/inside', { ring: ring.toFixed(2), ins: ins.toFixed(2) });
+          return { ...c, area: qa / imgArea, ring, inside: ins, minSide: Math.min(...sides) };
+        };
+        let valid = pool.map(evalCand).filter(Boolean);
+        // A rectangle around several prints (a group) is not itself a print.
+        valid = valid.filter((v) => {
+          const va = polyArea(v.q);
+          const inner = valid.filter((u) => u !== v && polyArea(u.q) < va * 0.9 && insideFraction(u.q, v.q) > 0.85);
+          for (let i = 0; i < inner.length; i++) for (let j = i + 1; j < inner.length; j++) {
+            if (quadIoU(inner[i].q, inner[j].q) < 0.1) return false;
+          }
+          return true;
+        });
+        // Largest first; prefer sharp edge candidates over blob outlines.
+        valid.sort((x, y) => (y.area * (y.blob ? 0.97 : 1)) - (x.area * (x.blob ? 0.97 : 1)));
+        let out = [];
+        for (const v of valid) {
+          if (out.some((o) => quadIoU(o.q, v.q) > 0.15 || containsQuad(o.q, v.q) || containsQuad(v.q, o.q))) continue;
+          out.push(v);
+        }
+
+        // Table -> album page -> prints: a large find whose inner margin is
+        // one flat colour is the album page itself; look inside it.
+        if (depth === 0) {
+          const expanded = [];
+          for (const o of out) {
+            const sub = o.area > 0.12 ? pageInside(o.q, mode) : null;
+            if (sub && sub.length) expanded.push(...sub); else expanded.push(o);
+          }
+          out = expanded;
+        }
+        return out;
+      };
+
+      const pageInside = (q, outerMode) => {
+        const counts = new Map();
+        let n = 0;
+        for (const g of [0.95, 0.9]) {
+          const r = scaled(q, g);
+          for (let e = 0; e < 4; e++) {
+            const a = r[e], b = r[(e + 1) % 4];
+            for (let t = 0.05; t < 0.96; t += 0.02) {
+              const idx = at(a[0] + (b[0] - a[0]) * t, a[1] + (b[1] - a[1]) * t);
+              if (idx < 0) continue;
+              n++;
+              const key = bin(idx);
+              counts.set(key, (counts.get(key) || 0) + 1);
+            }
+          }
+        }
+        let best = -1, bc = 0;
+        for (const key of counts.keys()) {
+          // Count neighbouring bins too: a page is flat but not perfectly so.
+          let c = 0;
+          for (const [k2, v] of counts) {
+            if (Math.abs((k2 >> 10) - (key >> 10)) <= 1 && Math.abs(((k2 >> 5) & 31) - ((key >> 5) & 31)) <= 1 && Math.abs((k2 & 31) - (key & 31)) <= 1) c += v;
+          }
+          if (c > bc) { bc = c; best = key; }
+        }
+        if (best < 0 || bc < n * 0.6 || best === outerMode) return null;
+        return level(q, 1, best);
+      };
+
+      // Background colour: one of the most common colours among the
+      // flattest pixels. The album page usually wins, but when a lot of
+      // table is in view it may be the table, so try the top two and keep
+      // whichever explains more prints.
+      const hist = new Uint32Array(32 * 32 * 32);
+      for (let p = 0; p < N; p++) if (T[p] <= flatCut) hist[bin(p)]++;
+      const modes = [];
+      const taken = new Uint8Array(hist.length);
+      let flatTotal = 0;
+      for (let i = 0; i < hist.length; i++) flatTotal += hist[i];
+      for (let pick = 0; pick < 3; pick++) {
+        let m = -1;
+        for (let i = 0; i < hist.length; i++) if (!taken[i] && hist[i] && (m < 0 || hist[i] > hist[m])) m = i;
+        if (m < 0) break;
+        let mass = 0;
+        for (let dl = -2; dl <= 2; dl++) for (let da = -2; da <= 2; da++) for (let db = -2; db <= 2; db++) {
+          const l = (m >> 10) + dl, a = ((m >> 5) & 31) + da, b = (m & 31) + db;
+          if (l < 0 || a < 0 || b < 0 || l > 31 || a > 31 || b > 31) continue;
+          const key = (l << 10) | (a << 5) | b;
+          mass += hist[key];
+          taken[key] = 1;
+        }
+        if (opts.debugModes) opts.debugModes({ pick, m: [(m >> 10) * 8, ((m >> 5) & 31) * 8, (m & 31) * 8], share: mass / flatTotal });
+        if (pick === 0 || mass > flatTotal * 0.04) modes.push(m);
+      }
+      // Live preview: the page colour barely changes between frames, so
+      // reuse the last winner and re-check all candidates every few frames.
+      const state = opts.albumState;
+      let tryModes = modes;
+      if (state && state.mode !== undefined && state.age < 8) {
+        const close = modes.find((m) => Math.abs((m >> 10) - (state.mode >> 10)) <= 2 &&
+          Math.abs(((m >> 5) & 31) - ((state.mode >> 5) & 31)) <= 2 && Math.abs((m & 31) - (state.mode & 31)) <= 2);
+        tryModes = [close !== undefined ? close : state.mode];
+        state.age++;
+      }
+      let out = [];
+      let outArea = 0;
+      let winner = tryModes[0];
+      for (const m of tryModes) {
+        const r = level(null, 0, m);
+        const area = r.reduce((a, o) => a + o.area, 0);
+        if (r.length > out.length || (r.length === out.length && area > outArea)) { out = r; outArea = area; winner = m; }
+      }
+      if (state && tryModes === modes) { state.mode = winner; state.age = 0; }
+      if (state && !out.length) state.age = 99;
+      out.sort((a, b) => {
+        const ca = centroid(a.q), cb = centroid(b.q);
+        if (Math.abs(ca[1] - cb[1]) > H * 0.12) return ca[1] - cb[1];
+        return ca[0] - cb[0];
+      });
+      return out;
     } finally {
       s.free();
     }
@@ -550,7 +926,8 @@
       Hm = cv.findHomography(A, B, cv.RANSAC, thresh, mask, 2000, 0.995);
       if (!Hm || Hm.empty()) return null;
       let inl = 0;
-      for (let i = 0; i < mask.rows; i++) if (mask.data[i]) inl++;
+      const md = mask.data;
+      for (let i = 0; i < mask.rows; i++) if (md[i]) inl++;
       return { H: Array.from(Hm.data64F), inliers: inl, total: n };
     } finally {
       A.delete(); B.delete(); mask.delete();
@@ -711,8 +1088,9 @@
       if (Hm.empty()) return null;
       const H = Array.from(Hm.data64F);
       const cur = [], ref = [];
+      const inlD = inl.data;
       for (let k = 0; k < m; k++) {
-        if (!inl.data[k]) continue;
+        if (!inlD[k]) continue;
         cur.push(b[k * 2], b[k * 2 + 1]);
         ref.push(a[k * 2], a[k * 2 + 1]);
       }

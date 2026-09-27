@@ -261,3 +261,49 @@ test('turns sideways portraits upright and leaves other photos alone', async () 
   assert.equal(P.detectOrientation(other).rotation, 0, 'no faces, no rotation');
   [rgb, rgba, print, other].forEach((m) => m.delete());
 });
+
+test('album page: finds whole prints, not rectangles inside them', () => {
+  const W = 1800, H = 1300;
+  const table = makeTable(cv, W, H, 5, [115, 85, 60]);
+  // A cream album page on the table.
+  const pageQuad = [[140, 110], [1660, 130], [1650, 1190], [150, 1170]];
+  const paper = new cv.Mat(1000, 1400, cv.CV_8UC4, new cv.Scalar(228, 220, 198, 255));
+  let scene = placePhoto(cv, table, paper, pageQuad);
+  paper.delete();
+  const Hpage = (() => {
+    const src = cv.matFromArray(4, 1, cv.CV_32FC2, [0, 0, 1400, 0, 1400, 1000, 0, 1000]);
+    const dst = cv.matFromArray(4, 1, cv.CV_32FC2, pageQuad.flat());
+    const M = cv.getPerspectiveTransform(src, dst);
+    const h = Array.from(M.data64F);
+    src.delete(); dst.delete(); M.delete();
+    return h;
+  })();
+  // Prints: one with a white border, one with a big dark "TV" rectangle
+  // inside, one plain. makePhoto also draws many small rectangles.
+  const prints = [
+    { rect: [110, 120, 520, 360], seed: 41, border: 22 },
+    { rect: [780, 110, 480, 360], seed: 42, tv: true },
+    { rect: [420, 560, 560, 360], seed: 43 },
+  ];
+  const truth = [];
+  for (const p of prints) {
+    const ph = makePhoto(cv, 600, 420, p.seed, { border: p.border });
+    if (p.tv) {
+      cv.rectangle(ph, new cv.Point(150, 90), new cv.Point(470, 330), new cv.Scalar(15, 15, 15, 255), -1);
+      cv.rectangle(ph, new cv.Point(175, 115), new cv.Point(445, 305), new cv.Scalar(200, 160, 90, 255), -1);
+    }
+    const [x, y, w, h] = p.rect;
+    const q = [[x, y], [x + w, y], [x + w, y + h], [x, y + h]].map((pt) => P.applyH(Hpage, pt));
+    const next = placePhoto(cv, scene, ph, q);
+    scene.delete();
+    scene = next;
+    ph.delete();
+    truth.push(q);
+  }
+  const found = P.detectQuads(scene, { multi: true, workSize: 640 });
+  const err = (a, b) => Math.max(...a.map((pt, i) => Math.hypot(pt[0] - b[i][0], pt[1] - b[i][1])));
+  console.log(`album page: found ${found.length} of ${truth.length}`);
+  assert.equal(found.length, truth.length, 'one outline per print, nothing extra');
+  for (const t of truth) assert.ok(found.some((f) => err(f.pts, t) < 30), 'each print outlined whole');
+  table.delete(); scene.delete();
+});

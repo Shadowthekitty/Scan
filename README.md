@@ -104,7 +104,16 @@ WebAssembly. The steps are:
 5. **Rectification.** The print's real aspect ratio is estimated from the
    perspective (Zhang & He's whiteboard method), then warped with cubic
    interpolation.
-6. **Restoration.** Tone curves are built from the photo's histograms,
+6. **Album pages.** Edges alone cannot tell a print from a rectangle inside
+   it, like a window, a TV or a picture frame. So the page colour is learned
+   from flat areas, trying a few candidates in case the table shows. The page
+   is then taken as the connected stretch of that colour, walled off by edges.
+   An outline counts as a print when every side follows a real edge, just
+   outside it is page, and inside it is not. When a whole album page is found
+   on a table, the search repeats inside it. On the live preview each outline
+   must show up in two of the last four detections, so the display does not
+   flicker.
+7. **Restoration.** Tone curves are built from the photo's histograms,
    followed by CLAHE on lightness, saturation and unsharp masking. Dust
    removal uses morphological top-hat and black-hat filters, a size filter,
    and inpainting.

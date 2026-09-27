@@ -4,6 +4,7 @@ import { $, toast, showBusy, hideBusy, vibrate } from './util.js';
 import { getSettings, setSetting } from './settings.js';
 
 const LIVE_SIZE = 400;
+const LIVE_SIZE_ALBUM = 560;
 const DOT_SPREAD = 0.62;
 // Keep showing the dots this long after tracking drops out.
 const TRACK_GRACE_MS = 1500;
@@ -14,6 +15,29 @@ const STAGES = {
   merge: 'Removing glare…',
   finish: 'Finishing…',
 };
+
+// Rough overlap of two quads (intersection over the smaller), by sampling.
+function quadOverlap(a, b) {
+  const inside = (pt, q) => {
+    let c = false;
+    for (let i = 0, j = 3; i < 4; j = i++) {
+      if (((q[i][1] > pt[1]) !== (q[j][1] > pt[1])) && (pt[0] < (q[j][0] - q[i][0]) * (pt[1] - q[i][1]) / (q[j][1] - q[i][1] + 1e-12) + q[i][0])) c = !c;
+    }
+    return c;
+  };
+  const all = a.concat(b);
+  const x0 = Math.min(...all.map((p) => p[0])), x1 = Math.max(...all.map((p) => p[0]));
+  const y0 = Math.min(...all.map((p) => p[1])), y1 = Math.max(...all.map((p) => p[1]));
+  let ia = 0, ib = 0, both = 0;
+  for (let i = 0; i < 16; i++) for (let j = 0; j < 16; j++) {
+    const pt = [x0 + (x1 - x0) * (i + 0.5) / 16, y0 + (y1 - y0) * (j + 0.5) / 16];
+    const A = inside(pt, a), B = inside(pt, b);
+    if (A) ia++;
+    if (B) ib++;
+    if (A && B) both++;
+  }
+  return Math.min(ia, ib) ? both / Math.min(ia, ib) : 0;
+}
 
 function applyH(H, p) {
   const w = H[6] * p[0] + H[7] * p[1] + H[8];
@@ -56,11 +80,17 @@ export class CaptureView {
     $('#cam-glare').classList.toggle('on', s.glare);
   }
 
+  aimHint() {
+    return getSettings().multi ? 'Fit the whole album page in the frame, then tap the button' : 'Fit the photo in the frame, then tap the button';
+  }
+
   toggleMode() {
     if (this.state !== 'aim') return;
     setSetting('multi', !getSettings().multi);
     this.quads = [];
+    this.tracks = [];
     this.syncToggles();
+    if (this.state === 'aim') this.hint(this.aimHint());
     toast(getSettings().multi ? 'Album page: finds every photo on the page' : 'Single photo');
   }
 
@@ -88,6 +118,7 @@ export class CaptureView {
     this.syncToggles();
     this.state = 'starting';
     this.quads = [];
+    this.tracks = [];
     this.setGuidedUi(false);
     if (!Camera.supported()) {
       this.hint(window.isSecureContext
@@ -116,7 +147,7 @@ export class CaptureView {
     }
     if (this.state !== 'starting') return;
     this.state = 'aim';
-    this.hint('Fit the photo in the frame, then tap the button');
+    this.hint(this.aimHint());
     this.requestWakeLock();
     this.startLoop();
   }
@@ -210,7 +241,8 @@ export class CaptureView {
   maybeDetect() {
     const now = performance.now();
     if (this.detecting || now - (this.lastDetect || 0) < 80) return;
-    const img = this.camera.grabSmall(LIVE_SIZE);
+    // Album pages need more detail: gaps between prints are narrow.
+    const img = this.camera.grabSmall(getSettings().multi ? LIVE_SIZE_ALBUM : LIVE_SIZE);
     if (!img) return;
     this.detecting = true;
     this.lastDetect = now;
@@ -220,34 +252,57 @@ export class CaptureView {
       .finally(() => { this.detecting = false; });
   }
 
+  /**
+   * Keep outlines steady: each detected photo is tracked across detections,
+   * shown only once it has been seen twice, and kept through a few misses.
+   * Without this, album pages flicker as outlines come and go.
+   */
   updateQuads(found) {
-    if (!found.length) {
-      this.missed++;
-      if (this.missed > 5) this.quads = [];
-      return;
-    }
-    this.missed = 0;
-    if (found.length !== this.quads.length) {
-      this.quads = found.map((q) => ({ pts: q.pts.map((p) => p.slice()) }));
-      return;
-    }
-    // Smooth corners to keep the outline steady.
+    const tracks = this.tracks || (this.tracks = []);
     const cen = (pts) => [pts.reduce((a, p) => a + p[0], 0) / 4, pts.reduce((a, p) => a + p[1], 0) / 4];
+    const size = (pts) => Math.hypot(pts[0][0] - pts[2][0], pts[0][1] - pts[2][1]);
+    // Corner order can rotate between detections; align before blending.
+    const align = (from, to) => {
+      let best = 0, bd = Infinity;
+      for (let s = 0; s < 4; s++) {
+        let d = 0;
+        for (let k = 0; k < 4; k++) d += Math.hypot(from[k][0] - to[(k + s) % 4][0], from[k][1] - to[(k + s) % 4][1]);
+        if (d < bd) { bd = d; best = s; }
+      }
+      return to.map((_, k) => to[(k + best) % 4]);
+    };
     const used = new Set();
-    this.quads = this.quads.map((old) => {
-      const c = cen(old.pts);
-      let best = -1, bd = Infinity;
+    for (const t of tracks) {
+      const c = cen(t.pts), sz = size(t.pts);
+      let bi = -1, bd = Infinity;
       found.forEach((f, i) => {
         if (used.has(i)) return;
         const fc = cen(f.pts);
         const d = Math.hypot(fc[0] - c[0], fc[1] - c[1]);
-        if (d < bd) { bd = d; best = i; }
+        const ratio = size(f.pts) / (sz || 1);
+        if (d < bd && d < Math.max(0.06, sz * 0.25) && ratio > 0.7 && ratio < 1.4) { bd = d; bi = i; }
       });
-      used.add(best);
-      const f = found[best];
-      if (bd > 0.15) return { pts: f.pts.map((p) => p.slice()) };
-      return { pts: old.pts.map((p, k) => [p[0] * 0.45 + f.pts[k][0] * 0.55, p[1] * 0.45 + f.pts[k][1] * 0.55]) };
-    });
+      t.recent = ((t.recent << 1) | (bi >= 0 ? 1 : 0)) & 15;
+      if (bi < 0) { t.misses++; continue; }
+      used.add(bi);
+      const f = align(t.pts, found[bi].pts);
+      t.pts = t.pts.map((p, k) => [p[0] * 0.45 + f[k][0] * 0.55, p[1] * 0.45 + f[k][1] * 0.55]);
+      t.hits++;
+      t.misses = 0;
+    }
+    found.forEach((f, i) => { if (!used.has(i)) tracks.push({ pts: f.pts.map((p) => p.slice()), hits: 1, misses: 0, recent: 1 }); });
+    // Two tracks on the same photo: keep the better established one.
+    tracks.sort((a, b) => b.hits - a.hits);
+    const kept = [];
+    for (const t of tracks) {
+      if (t.misses > 4) continue;
+      if (kept.some((k) => quadOverlap(k.pts, t.pts) > 0.4)) continue;
+      kept.push(t);
+    }
+    this.tracks = kept;
+    // Show a photo once it was found in at least 2 of the last 4 detections.
+    const bits = (v) => (v & 1) + ((v >> 1) & 1) + ((v >> 2) & 1) + ((v >> 3) & 1);
+    this.quads = kept.filter((t) => bits(t.recent) >= 2).map((t) => ({ pts: t.pts }));
   }
 
   /* ---------------- drawing ---------------- */

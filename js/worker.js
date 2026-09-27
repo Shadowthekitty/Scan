@@ -71,10 +71,13 @@ function smallGray(image) {
 /* Live helpers                                                      */
 /* ---------------------------------------------------------------- */
 
+// Remembers the album page colour between live frames.
+const albumState = {};
+
 function cmdDetect({ image, multi }) {
   const m = P.matFromImage(image);
   try {
-    const quads = P.detectQuads(m, { multi, workSize: Math.max(image.width, image.height), minSupport: 0.5 });
+    const quads = P.detectQuads(m, { multi, workSize: Math.max(image.width, image.height), minSupport: 0.5, albumState: multi ? albumState : undefined });
     return {
       quads: quads.map((q) => ({ pts: q.pts.map((p) => [p[0] / image.width, p[1] / image.height]), score: q.score })),
     };
@@ -165,9 +168,17 @@ function processFrames(mats, opts, progress) {
     progress('detect', 0);
     let found = P.detectQuads(ref, { multi: !!opts.multi, workSize: 640 }).map((q) => q.pts);
     let detected = found.length > 0;
-    if (!found.length && opts.hintQuads && opts.hintQuads.length) {
-      found = opts.hintQuads.map((q) => q.map((p) => [p[0] * W, p[1] * H]));
+    const hints = (opts.hintQuads || []).map((q) => q.map((p) => [p[0] * W, p[1] * H]));
+    if (!found.length && hints.length) {
+      found = hints;
       detected = true;
+    } else if (opts.multi) {
+      // Keep album prints the live preview saw but this frame missed.
+      for (const h of hints) {
+        if (!P.isConvexQuad(h)) continue;
+        if (found.some((f) => P.quadIoU(f, h) > 0.2)) continue;
+        found.push(h);
+      }
     }
     if (!found.length) {
       const i = Math.round(Math.min(W, H) * 0.02);

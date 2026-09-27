@@ -1,7 +1,7 @@
 // Offline support. The large OpenCV engine and face model are served from the
 // cache first. App files use stale-while-revalidate: they load instantly from
 // the cache, and a fresh copy is fetched in the background for next time.
-const VERSION = 'scan-v2';
+const VERSION = 'scan-v3';
 const ENGINE = ['vendor/opencv.js', 'models/face_detection_yunet_2023mar.onnx'];
 const ASSETS = [
   './',
