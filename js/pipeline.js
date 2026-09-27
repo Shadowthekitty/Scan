@@ -417,6 +417,33 @@
       if (!multi) {
         const minSupport = opts.minSupport !== undefined ? opts.minSupport : 0.45;
         chosen = uniq.filter((c) => c.support >= minSupport).slice(0, 1);
+        // A print lying on a sheet of paper: the sheet outline scores higher
+        // because it is bigger. Prefer the print unless the white around it
+        // is an even border (then it is the print's own border).
+        if (chosen.length) {
+          const outer = chosen[0];
+          const oa = polyArea(outer.q);
+          const inner = uniq.filter((c) => c !== outer && c.support >= 0.75 && polyArea(c.q) >= oa * 0.25 &&
+            polyArea(c.q) < oa * 0.95 && insideFraction(c.q, outer.q) > 0.97)
+            .sort((x, y) => polyArea(y.q) - polyArea(x.q))[0];
+          if (inner) {
+            const band = bandBetween(gray, inner.q, outer.q);
+            // A separate print has four crisp straight edges; an outline
+            // along picture content (a skyline under a white sky) does not.
+            if (band.light && (!band.even || band.shadow)) {
+              const grad = gradients(gray);
+              const ci = centroid(inner.q);
+              const straight = [0, 1, 2, 3].every((k) => {
+                const a = inner.q[k], b = inner.q[(k + 1) % 4];
+                const len = Math.hypot(b[0] - a[0], b[1] - a[1]) || 1;
+                let n = [-(b[1] - a[1]) / len, (b[0] - a[0]) / len];
+                if (((a[0] + b[0]) / 2 - ci[0]) * n[0] + ((a[1] + b[1]) / 2 - ci[1]) * n[1] < 0) n = [-n[0], -n[1]];
+                return crispStraightSide(grad, a, b, n);
+              });
+              if (straight) chosen = [inner];
+            }
+          }
+        }
       } else {
         // Walls between page and prints: brightness edges without tiny specks.
         // (Colour edges fire on sensor noise across dark pages.)
@@ -438,6 +465,24 @@
           const ca = centroid(a.q), cb = centroid(b.q);
           if (Math.abs(ca[1] - cb[1]) > H * 0.12) return ca[1] - cb[1];
           return ca[0] - cb[0];
+        });
+      }
+
+      // Recover white parts of a print (borders, a bright sky) that blend
+      // into a light background and were left outside the outline.
+      if (opts.extend !== false) {
+        const grad = gradients(gray);
+        chosen = chosen.map((c) => {
+          // On album pages only a border on all four sides counts: the page
+          // around a print is a light band too, but it is page, not print.
+          const strict = multi;
+          let q = extendToPrintEdge(gray, c.q, { allSides: strict, grad });
+          // A second pass catches a white border beyond a bright sky.
+          if (!strict && q !== c.q) q = extendToPrintEdge(gray, q, { grad });
+          if (q === c.q) return c;
+          const others = chosen.filter((o) => o !== c);
+          if (others.some((o) => quadIoU(o.q, q) > 0.02)) return c;
+          return { ...c, q };
         });
       }
 
@@ -802,6 +847,290 @@
     } finally {
       s.free();
     }
+  }
+
+  /**
+   * A print's outer part can be white (a border, a bright sky, snow). On a
+   * light background that edge is too faint to detect, so the outline stops
+   * where the picture content starts. For each side, look outward: average
+   * the brightness along the whole side (which reveals very faint edges),
+   * walk across a smooth bright band, and find where it ends in a step or in
+   * the thin shadow line a print casts. Move the side out to that line.
+   *
+   * allSides: only extend when all four sides show such a band (a border),
+   * used on album pages where the page between prints is also a band.
+   */
+  // Is side a->b a crisp straight edge along its whole length (the physical
+  // edge of a print), rather than picture content such as a skyline?
+  function crispStraightSide(grad, a, b, n) {
+    const { gx, gy, W, H } = grad;
+    const mags = [], offs = [];
+    for (let i = 0; i < 40; i++) {
+      const t = 0.1 + 0.8 * i / 39;
+      const bx = a[0] + (b[0] - a[0]) * t, by = a[1] + (b[1] - a[1]) * t;
+      let best = 0, bo = 0;
+      for (let o = -4; o <= 4; o++) {
+        const x = Math.round(bx + n[0] * o), y = Math.round(by + n[1] * o);
+        if (x < 1 || y < 1 || x >= W - 1 || y >= H - 1) continue;
+        const v = Math.abs(gx[y * W + x] * n[0] + gy[y * W + x] * n[1]);
+        if (v > best) { best = v; bo = o; }
+      }
+      mags.push(best); offs.push(bo);
+    }
+    const sorted = mags.slice().sort((x, y) => x - y);
+    const med = sorted[sorted.length >> 1];
+    const thr = Math.max(20, med * 0.5);
+    const strong = offs.filter((_, i) => mags[i] >= thr);
+    if (strong.length < mags.length * 0.85 || med < 20) return false;
+    const mean = strong.reduce((x, y) => x + y, 0) / strong.length;
+    const sd = Math.sqrt(strong.reduce((x, y) => x + (y - mean) * (y - mean), 0) / strong.length);
+    return sd <= 1.0;
+  }
+
+  /**
+   * The space between an inner and an outer outline: `light` when it is a
+   * smooth light band all round (paper), `even` when its widths are similar
+   * like a print's border (up to 4x, for instant-photo bottoms) rather than
+   * the uneven margin of a sheet the print lies on.
+   */
+  function bandBetween(gray, inner, outer) {
+    const W = gray.cols, H = gray.rows, G = gray.data;
+    const c = centroid(inner);
+    const widths = [];
+    for (let k = 0; k < 4; k++) {
+      const a = inner[k], b = inner[(k + 1) % 4];
+      const len = Math.hypot(b[0] - a[0], b[1] - a[1]) || 1;
+      let nx = -(b[1] - a[1]) / len, ny = (b[0] - a[0]) / len;
+      const mx = (a[0] + b[0]) / 2, my = (a[1] + b[1]) / 2;
+      if ((mx - c[0]) * nx + (my - c[1]) * ny < 0) { nx = -nx; ny = -ny; }
+      // Distance to the outer outline along the normal from the midpoint.
+      let w = 0;
+      for (let k2 = 0; k2 < 4; k2++) {
+        const p = outer[k2], q = outer[(k2 + 1) % 4];
+        const hit = intersectLines([mx, my], [nx, ny], p, [q[0] - p[0], q[1] - p[1]]);
+        if (!hit) continue;
+        const d = (hit[0] - mx) * nx + (hit[1] - my) * ny;
+        if (d > 0 && (!w || d < w)) w = d;
+      }
+      if (!w) return { light: false, even: false };
+      widths.push(w);
+      // The band itself: light and smooth along and across.
+      let prev = -1, jumps = 0, n = 0, sum = 0;
+      for (let d = 3; d < w - 3; d += 1) {
+        for (let i = 0; i < 20; i++) {
+          const t = 0.15 + 0.7 * i / 19;
+          const x = Math.round(a[0] + (b[0] - a[0]) * t + nx * d), y = Math.round(a[1] + (b[1] - a[1]) * t + ny * d);
+          if (x < 0 || y < 0 || x >= W || y >= H) continue;
+          const g = G[y * W + x];
+          sum += g; n++;
+          if (prev >= 0 && Math.abs(g - prev) > 18) jumps++;
+          prev = g;
+        }
+        prev = -1;
+      }
+      if (!n || sum / n < 150 || jumps > n * 0.08) return { light: false, even: false };
+    }
+    return { light: true, even: Math.max(...widths) <= Math.min(...widths) * 4, shadow: castsShadow(gray, inner) };
+  }
+
+  // A thin dark line just outside a quad on some side: the shadow a print
+  // casts on the surface it lies on. It is smooth along the side, unlike
+  // picture content; a printed border casts none. With gradients given the
+  // test is stricter, for outlines that may run along picture content: the
+  // side must be a crisp straight edge and the dark line a few pixels wide.
+  // The end of an uneven skyline under a white sky is neither.
+  function castsShadow(gray, quad, grad) {
+    const W = gray.cols, H = gray.rows, G = gray.data;
+    const c = centroid(quad);
+    for (let k = 0; k < 4; k++) {
+      const a = quad[k], b = quad[(k + 1) % 4];
+      const len = Math.hypot(b[0] - a[0], b[1] - a[1]) || 1;
+      let nx = -(b[1] - a[1]) / len, ny = (b[0] - a[0]) / len;
+      const mx = (a[0] + b[0]) / 2, my = (a[1] + b[1]) / 2;
+      if ((mx - c[0]) * nx + (my - c[1]) * ny < 0) { nx = -nx; ny = -ny; }
+      const v = [], tex = [];
+      for (let d = 0; d <= 18; d++) {
+        let sum = 0, cnt = 0, ts = 0, prev = -1;
+        for (let i = 0; i < 40; i++) {
+          const t = 0.15 + 0.7 * i / 39;
+          const x = Math.round(a[0] + (b[0] - a[0]) * t + nx * d), y = Math.round(a[1] + (b[1] - a[1]) * t + ny * d);
+          if (x < 0 || y < 0 || x >= W || y >= H) continue;
+          const g = G[y * W + x];
+          sum += g; cnt++;
+          if (prev >= 0) ts += Math.abs(g - prev);
+          prev = g;
+        }
+        v.push(cnt ? sum / cnt : 0);
+        tex.push(cnt > 1 ? ts / (cnt - 1) : 99);
+      }
+      const far = (v[14] + v[15] + v[16] + v[17] + v[18]) / 5;
+      if (far < 150) continue;
+      // Beyond a shadow the surface is level; a gradient (a sky getting
+      // lighter away from a skyline) keeps rising and is not a shadow.
+      if (Math.abs(v[18] - v[12]) > 2 || Math.abs(v[11] - far) > 3) continue;
+      let near = Infinity;
+      for (let d = 2; d <= 8; d++) {
+        if (tex[d] > 7) continue;
+        // A shadow fades gently; the blurred edge climbs steeply.
+        if (grad && (tex[d + 1] > 7 || v[d + 1] > far - 3 || v[d + 1] - v[d] > 10)) continue;
+        if (v[d] < near) near = v[d];
+      }
+      if (far - near >= 6 && (!grad || crispStraightSide(grad, a, b, [nx, ny]))) return true;
+    }
+    return false;
+  }
+
+  function gradients(gray) {
+    const b = new cv.Mat(), dx = new cv.Mat(), dy = new cv.Mat();
+    cv.GaussianBlur(gray, b, new cv.Size(3, 3), 0);
+    cv.Sobel(b, dx, cv.CV_32F, 1, 0, 3);
+    cv.Sobel(b, dy, cv.CV_32F, 0, 1, 3);
+    const out = { gx: new Float32Array(dx.data32F), gy: new Float32Array(dy.data32F), W: gray.cols, H: gray.rows };
+    b.delete(); dx.delete(); dy.delete();
+    return out;
+  }
+
+  function extendToPrintEdge(gray, quad, opts) {
+    opts = opts || {};
+    // A print casting a shadow is lying on the light surface around it.
+    const grad = opts.grad || gradients(gray);
+    // Album pages only extend a border on all four sides, so any hint of a
+    // shadow counts there.
+    if (castsShadow(gray, quad, opts.allSides ? null : grad)) return quad;
+    const W = gray.cols, H = gray.rows, G = gray.data;
+    const c = centroid(quad);
+    const minDim = Math.min(W, H);
+    const eMin = Math.max(5, Math.round(minDim * 0.012));
+    const px = (x, y) => {
+      const xi = Math.round(x), yi = Math.round(y);
+      return xi >= 0 && yi >= 0 && xi < W && yi < H ? G[yi * W + xi] : -1;
+    };
+    // Width of the light band beyond side a-b, measured on the stretch
+    // t0..t1 of the side; 0 when there is none.
+    const bandWidth = (a, b, nx, ny, D, across, t0, t1) => {
+      // Brightness profile across the side, averaged along it. It stops at
+      // the frame edge.
+      const N = Math.round(50 * (t1 - t0) / 0.7);
+      const v = new Float32Array(D + 1), tex = new Float32Array(D + 1);
+      for (let d = 0; d <= D; d++) {
+        let sum = 0, cnt = 0, tsum = 0, prev = -1;
+        for (let i = 0; i < N; i++) {
+          const t = t0 + (t1 - t0) * i / (N - 1);
+          const g = px(a[0] + (b[0] - a[0]) * t + nx * d, a[1] + (b[1] - a[1]) * t + ny * d);
+          if (g < 0) continue;
+          sum += g; cnt++;
+          if (prev >= 0) tsum += Math.abs(g - prev);
+          prev = g;
+        }
+        if (cnt < N * 0.7) { D = d - 1; break; }
+        v[d] = sum / cnt;
+        tex[d] = tsum / Math.max(1, cnt - 1);
+      }
+      if (D <= eMin + 6) return 0;
+      const sv = new Float32Array(D + 1);
+      for (let d = 0; d <= D; d++) sv[d] = (v[Math.max(0, d - 1)] + 2 * v[d] + v[Math.min(D, d + 1)]) / 4;
+      // Along picture content the outline may sit just inside an uneven
+      // skyline (treetops, roofs): skip that textured fringe to where the
+      // smooth light band starts. A shadow or plain surface is not textured,
+      // so it is never skipped.
+      let d = 2;
+      if (tex[2] > 7 || tex[3] > 7) {
+        const maxSkip = Math.min(D - 12, Math.round(across * 0.15) + 5);
+        let found = -1;
+        for (let s0 = 3; s0 <= maxSkip && found < 0; s0++) {
+          let ok = true;
+          for (let j = s0; j < s0 + 6; j++) if (tex[j] > 7 || sv[j] < 150 || Math.abs(sv[j + 1] - sv[j]) > 2.5) { ok = false; break; }
+          if (ok) found = s0;
+        }
+        if (found < 0) return 0;
+        d = found;
+      } else {
+        // The outline can sit on the blurred edge where a sky begins: step
+        // over that short climb into it. Not on album pages, where the
+        // climb may hold a faint shadow.
+        while (!opts.allSides && d < 6 && sv[d + 1] - sv[d] > 2.5) d++;
+      }
+      // Walk across the band while it stays light and smooth; stop at any
+      // dip below it (a print's shadow line) or a jump.
+      let top = sv[d];
+      while (d < D - 4 && sv[d] >= 150 && tex[d] <= 7 && Math.abs(sv[d + 1] - sv[d]) <= 2.5 && sv[d + 1] >= top - 3) {
+        d++;
+        if (sv[d] > top) top = sv[d];
+      }
+      if (d < eMin || d >= D - 4) return 0;
+      // The band must end in a real line: a step down or a shadow dip.
+      let best = 0, bestE = -1;
+      for (let e = d; e <= Math.min(D - 3, d + 6); e++) {
+        const before = sv[e - 3], after = sv[e + 3];
+        const step = before - after;
+        const dip = Math.min(before, after) - sv[e];
+        const strength = Math.max(step, dip * 1.5);
+        if (strength > best) { best = strength; bestE = e; }
+      }
+      return best >= 5 && bestE > 0 ? bestE : 0;
+    };
+    const widths = [];
+    const lines = [];
+    const tilted = [];
+    for (let k = 0; k < 4; k++) {
+      const a = quad[k], b = quad[(k + 1) % 4];
+      const len = Math.hypot(b[0] - a[0], b[1] - a[1]) || 1;
+      let nx = -(b[1] - a[1]) / len, ny = (b[0] - a[0]) / len;
+      const mx = (a[0] + b[0]) / 2, my = (a[1] + b[1]) / 2;
+      if ((mx - c[0]) * nx + (my - c[1]) * ny < 0) { nx = -nx; ny = -ny; }
+      // How far the opposite side is: a white part is at most a fraction of it.
+      const o1 = quad[(k + 2) % 4], o2 = quad[(k + 3) % 4];
+      const across = Math.hypot(mx - (o1[0] + o2[0]) / 2, my - (o1[1] + o2[1]) / 2);
+      const D = Math.round(opts.allSides ? Math.min(across * 0.2, minDim * 0.25) : Math.min(across * 1.2, minDim * 0.45));
+      lines.push({ a, dir: [(b[0] - a[0]) / len, (b[1] - a[1]) / len], n: [nx, ny] });
+      tilted.push(null);
+      if (D <= eMin + 6) { widths.push(0); continue; }
+      // An outline along a skyline can run at a slant to the print's edge,
+      // which blurs the edge in a profile along the whole side. Each half is
+      // measured on its own too, so the new side can tilt.
+      const w1 = bandWidth(a, b, nx, ny, D, across, 0.15, 0.5);
+      const w2 = bandWidth(a, b, nx, ny, D, across, 0.5, 0.85);
+      if (w1 && w2 && Math.abs(w1 - w2) < len * 0.35 * 0.5) {
+        tilted[k] = [0.325, w1, 0.675, w2];
+        widths.push((w1 + w2) / 2);
+      } else {
+        widths.push(bandWidth(a, b, nx, ny, D, across, 0.15, 0.85));
+      }
+    }
+    const ext = widths.filter((w) => w > 0);
+    if (!ext.length) return quad;
+    // A band of similar width on all four sides is a border.
+    const border = ext.length === 4 && Math.max(...ext) <= Math.min(...ext) * 4;
+    if (opts.allSides && !border) return quad;
+    if (!border) {
+      // Otherwise only extend across picture content (a skyline, a bright
+      // window), never past a crisp straight edge: that is the print's own
+      // edge, and the white beyond it is the surface it lies on.
+      for (let k = 0; k < 4; k++) {
+        if (!widths[k]) continue;
+        const a = quad[k], b = quad[(k + 1) % 4];
+        if (crispStraightSide(grad, a, b, lines[k].n)) widths[k] = 0;
+      }
+      if (!widths.some((w) => w > 0)) return quad;
+    }
+    const moved = lines.map((l, k) => {
+      const b = quad[(k + 1) % 4];
+      const at = (t, w) => [l.a[0] + (b[0] - l.a[0]) * t + l.n[0] * w, l.a[1] + (b[1] - l.a[1]) * t + l.n[1] * w];
+      if (!widths[k] || !tilted[k]) return { p: at(0, widths[k]), d: l.dir };
+      const [t1, w1, t2, w2] = tilted[k];
+      const p1 = at(t1, w1), p2 = at(t2, w2);
+      const dl = Math.hypot(p2[0] - p1[0], p2[1] - p1[1]) || 1;
+      return { p: p1, d: [(p2[0] - p1[0]) / dl, (p2[1] - p1[1]) / dl] };
+    });
+    const out = [];
+    for (let k = 0; k < 4; k++) {
+      const l1 = moved[(k + 3) % 4], l2 = moved[k];
+      const pt = intersectLines(l1.p, l1.d, l2.p, l2.d);
+      if (!pt) return quad;
+      out.push(pt);
+    }
+    if (!isConvexQuad(out) || polyArea(out) > polyArea(quad) * 2.2) return quad;
+    return out;
   }
 
   function containsQuad(outer, inner) {
@@ -1961,7 +2290,7 @@
     init, setFaceModel, scope, copyMat, matFromImage, imageFromMat, resizeMax, toGray,
     orderQuad, polyArea, isConvexQuad, quadAngles, pointInQuad, quadIoU, mul3, inv3, applyH,
     scaleMat, translateMat, detectQuads, refineQuad, createTracker, trackFrame, alignFrames,
-    mergeFrames, TRACKING, rectangleAspect, snapRatio, outputSize, rectify, presetCurves, removeDust,
+    mergeFrames, TRACKING, insideFraction, rectangleAspect, snapRatio, outputSize, rectify, presetCurves, removeDust,
     render, detectOrientation, sharpness, homographySane,
   };
 

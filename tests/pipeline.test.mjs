@@ -1,7 +1,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import {
-  loadPipeline, makePhoto, makeTable, placePhoto, viewOf, addGlare, cameraH, meanAbsDiff,
+  loadPipeline, makePhoto, makeTable, placePhoto, viewOf, addGlare, cameraH, meanAbsDiff, rng,
 } from './helpers.mjs';
 
 const { cv, P } = await loadPipeline();
@@ -306,4 +306,48 @@ test('album page: finds whole prints, not rectangles inside them', () => {
   assert.equal(found.length, truth.length, 'one outline per print, nothing extra');
   for (const t of truth) assert.ok(found.some((f) => err(f.pts, t) < 30), 'each print outlined whole');
   table.delete(); scene.delete();
+});
+
+test('keeps white parts of a print on a light surface', () => {
+  // A print with a white border, and one with a bright white sky under an
+  // uneven skyline, each lying on an off-white table.
+  const make = (kind, seed) => {
+    const r = rng(seed);
+    const W = 1600, H = 1200;
+    const table = new cv.Mat(H, W, cv.CV_8UC4, new cv.Scalar(238, 237, 233, 255));
+    const td = table.data;
+    for (let o = 0; o < td.length; o += 4) { const n = (r() - 0.5) * 6; td[o] += n; td[o + 1] += n; td[o + 2] += n; }
+    let photo = makePhoto(cv, 900, 600, 50 + seed);
+    if (kind === 'border') {
+      const b = new cv.Mat();
+      const inner = new cv.Mat();
+      cv.resize(photo, inner, new cv.Size(820, 520));
+      cv.copyMakeBorder(inner, b, 40, 40, 40, 40, cv.BORDER_CONSTANT, new cv.Scalar(246, 245, 240, 255));
+      photo.delete(); inner.delete();
+      photo = b;
+    } else {
+      const d = photo.data;
+      let h = 200;
+      for (let x = 0; x < 900; x++) {
+        if (x % 40 === 0) h = 170 + Math.round(r() * 70);
+        for (let y = 0; y < h; y++) {
+          const o = (y * 900 + x) * 4, v = 252 - y * 0.1;
+          d[o] = v; d[o + 1] = v; d[o + 2] = v;
+        }
+      }
+    }
+    const q = [[330, 250], [1290, 268], [1276, 925], [318, 902]];
+    const scene = placePhoto(cv, table, photo, q);
+    table.delete(); photo.delete();
+    return { scene, q };
+  };
+  for (const [kind, seed] of [['border', 1], ['border', 2], ['sky', 1], ['sky', 2], ['sky', 3]]) {
+    const { scene, q } = make(kind, seed);
+    const f = P.detectQuads(scene, { workSize: 640 });
+    const quad = P.refineQuad(scene, f[0].pts);
+    const ratio = P.polyArea(quad) / P.polyArea(q);
+    console.log(`${kind} (${seed}): outline covers ${(ratio * 100).toFixed(0)}% of the print`);
+    assert.ok(ratio > 0.97 && ratio < 1.03, `${kind}: whole print kept`);
+    scene.delete();
+  }
 });

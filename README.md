@@ -85,8 +85,12 @@ WebAssembly. The steps are:
 
 1. **Detection.** Canny edges on brightness, colour (Lab) and saturation
    channels feed a contour search. Each candidate quadrilateral is scored by
-   how well its sides follow real edges. Each side is then refitted to the
-   strongest nearby gradient at higher resolution.
+   how well its sides follow real edges. When a white part of the print (a
+   border or a bright sky) meets a light surface, the edge there is faint, so
+   the outline is carried across the white band to where the print really
+   ends. A shadow along a straight edge means the print ends there already.
+   Each side is then refitted to the strongest nearby gradient at higher
+   resolution.
 2. **Tracking.** During the guided shots, points are followed from frame to
    frame with optical flow, and each is tied to its place in the first shot,
    so the photo's position is always fitted directly. Every few frames ORB

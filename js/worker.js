@@ -173,9 +173,19 @@ function processFrames(mats, opts, progress) {
       found = hints;
       detected = true;
     } else if (opts.multi) {
-      // Keep album prints the live preview saw but this frame missed.
       for (const h of hints) {
         if (!P.isConvexQuad(h)) continue;
+        // The live preview showed this print steadily. If this frame broke it
+        // into pieces (or kept only part of it), trust the preview's outline.
+        const ha = P.polyArea(h);
+        const parts = found.filter((f) => P.insideFraction(f, h) > 0.8 && P.polyArea(f) < ha * 0.9);
+        const covered = parts.reduce((a, f) => a + P.polyArea(f), 0);
+        if (parts.length && (parts.length >= 2 || covered < ha * 0.7)) {
+          found = found.filter((f) => !parts.includes(f));
+          found.push(h);
+          continue;
+        }
+        // Keep album prints the live preview saw but this frame missed.
         if (found.some((f) => P.quadIoU(f, h) > 0.2)) continue;
         found.push(h);
       }
