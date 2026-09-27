@@ -247,6 +247,40 @@
     return quad;
   }
 
+  /**
+   * Quads that restore a missing corner: when part of a print blends into
+   * the background, its outline is a polygon with the true sides as its
+   * long straight runs and a short cut across the missing part. Any four of
+   * those runs, extended until they meet, may be the print.
+   */
+  function restoredQuads(hullPts) {
+    if (hullPts.length < 5) return [];
+    const hull = cv.matFromArray(hullPts.length, 1, cv.CV_32SC2, hullPts.flat());
+    const peri = cv.arcLength(hull, true);
+    const approx = new cv.Mat();
+    cv.approxPolyDP(hull, approx, 0.02 * peri, true);
+    const pts = [];
+    const ad = approx.data32S;
+    for (let i = 0; i < approx.rows; i++) pts.push([ad[i * 2], ad[i * 2 + 1]]);
+    approx.delete(); hull.delete();
+    const n = pts.length;
+    if (n < 5 || n > 6) return [];
+    const edges = pts.map((p, i) => ({ p, q: pts[(i + 1) % n] }));
+    const out = [];
+    const pick = (idx) => {
+      const quad = [];
+      for (let k = 0; k < 4; k++) {
+        const e1 = edges[idx[k]], e2 = edges[idx[(k + 1) % 4]];
+        const pt = intersectLines(e1.p, [e1.q[0] - e1.p[0], e1.q[1] - e1.p[1]], e2.p, [e2.q[0] - e2.p[0], e2.q[1] - e2.p[1]]);
+        if (!pt) return;
+        quad.push(pt);
+      }
+      out.push(quad);
+    };
+    for (let a = 0; a < n; a++) for (let b = a + 1; b < n; b++) for (let c = b + 1; c < n; c++) for (let d = c + 1; d < n; d++) pick([a, b, c, d]);
+    return out;
+  }
+
   function edgeSupport(edgeMap, quad) {
     const w = edgeMap.cols, h = edgeMap.rows, d = edgeMap.data;
     const per = [];
@@ -374,20 +408,20 @@
           c.delete();
           if (hullArea < minArea) continue;
           const q = polygonToQuad(hullPts);
-          if (!q) continue;
-          raw.push({ q: orderQuad(q), hullArea });
+          if (q) raw.push({ q: orderQuad(q), hullArea });
+          if (!multi) for (const r of restoredQuads(hullPts)) raw.push({ q: orderQuad(r), hullArea, restored: true });
         }
       }
 
       const margin = 2;
       const cands = [];
       const dbg = opts.debug ? (why, q, extra) => opts.debug.push({ why, q: q.map((p) => [p[0] / scale, p[1] / scale]), extra }) : () => {};
-      for (const { q, hullArea } of raw) {
+      for (const { q, hullArea, restored } of raw) {
         if (!isConvexQuad(q)) { dbg('concave', q); continue; }
         const area = polyArea(q);
         if (area < minArea) { dbg('small', q); continue; }
         const fill = hullArea / area;
-        if (fill < 0.8 || fill > 1.2) { dbg('fill', q, fill); continue; }
+        if (fill < (restored ? 0.6 : 0.8) || fill > 1.2) { dbg('fill', q, fill); continue; }
         const angles = quadAngles(q);
         if (angles.some((a) => a < 45 || a > 135)) { dbg('angles', q, angles); continue; }
         if (q.some((p) => p[0] < -W * 0.05 || p[1] < -H * 0.05 || p[0] > W * 1.05 || p[1] > H * 1.05)) { dbg('outside', q); continue; }
@@ -401,22 +435,24 @@
         const areaFrac = area / imgArea;
         const score = supScore * supScore * (0.45 + 0.55 * Math.sqrt(areaFrac)) * angScore;
         dbg('cand', q, { score, sup, areaFrac });
-        cands.push({ q, score, support: supScore, area: areaFrac });
+        cands.push({ q, score, support: supScore, area: areaFrac, restored });
       }
       cands.sort((a, b) => b.score - a.score);
 
       // Drop near-duplicates produced by the different edge maps.
       const diag = Math.hypot(W, H);
       const uniq = [];
-      for (const c of cands) {
+      // Ordinary candidates first, so a restored copy never displaces one.
+      for (const c of [...cands.filter((x) => !x.restored), ...cands.filter((x) => x.restored)]) {
         if (uniq.some((u) => c.q.every((p, i) => dist(p, u.q[i]) < diag * 0.025))) continue;
         uniq.push(c);
       }
+      uniq.sort((a, b) => b.score - a.score);
 
       let chosen;
       if (!multi) {
         const minSupport = opts.minSupport !== undefined ? opts.minSupport : 0.45;
-        chosen = uniq.filter((c) => c.support >= minSupport).slice(0, 1);
+        chosen = uniq.filter((c) => c.support >= minSupport && !c.restored).slice(0, 1);
         // A print lying on a sheet of paper: the sheet outline scores higher
         // because it is bigger. Prefer the print unless the white around it
         // is an even border (then it is the print's own border).
@@ -470,15 +506,74 @@
 
       // Recover white parts of a print (borders, a bright sky) that blend
       // into a light background and were left outside the outline.
-      if (opts.extend !== false) {
-        const grad = gradients(gray);
+      const grad = opts.extend !== false ? gradients(gray) : null;
+      // Outlines with four crisp straight sides are complete already.
+      const allCrisp = (q) => [0, 1, 2, 3].every((k) => crispStraightSide(grad, q[k], q[(k + 1) % 4], outwardNormal(q[k], q[(k + 1) % 4], centroid(q))));
+      if (!multi && grad && !(chosen.length && allCrisp(chosen[0].q))) {
+        const fm = faintMaps(labCh, s);
+        // The surface: what the frame's edges mostly show.
+        const ring = [];
+        {
+          const { W: fw, H: fh } = fm;
+          const b = Math.round(Math.min(fw, fh) * 0.04);
+          const corners = [[b, b], [fw - 1 - b, b], [fw - 1 - b, fh - 1 - b], [b, fh - 1 - b]];
+          for (let k = 0; k < 4; k++) {
+            const a = corners[k], e = corners[(k + 1) % 4], cf = [fw / 2, fh / 2];
+            for (const st of stripStats(fm, a, e, outwardNormal(a, e, cf), 8, -b + 1, b - 1)) if (st) ring.push(st);
+          }
+        }
+        const rmed = (key) => { const v = ring.map((r) => r[key]).sort((x, y) => x - y); return v[v.length >> 1]; };
+        const rL = rmed('L'), rA = rmed('A'), rB = rmed('B'), rT = rmed('T');
+        const surfaceLike = (st) => !st || (Math.abs(st.L - rL) <= Math.max(20, rL * 0.15) &&
+          Math.abs(st.A - rA) <= 8 && Math.abs(st.B - rB) <= 8 && st.T <= Math.max(30, rT * 3));
+        // How well every side of an outline follows an edge, faint or not,
+        // with the surface beyond it.
+        const quality = (q) => {
+          const c = centroid(q);
+          let worst = 1;
+          for (let k = 0; k < 4; k++) {
+            const a = q[k], b = q[(k + 1) % 4], n = outwardNormal(a, b, c);
+            const e = edgeHits(fm, a, b, n, 8, 5).hits / 8;
+            const sf = stripStats(fm, a, b, n, 8, 4, 10).filter(surfaceLike).length / 8;
+            worst = Math.min(worst, e, sf);
+          }
+          return worst;
+        };
+        let best = null;
+        if (chosen.length) {
+          const q = completeQuad(fm, grad, chosen[0].q);
+          best = { c: chosen[0], q, qual: quality(q) };
+        }
+        // An outline with a side that follows no edge may be only part of
+        // the print (a white part cut off). Another candidate that contains
+        // it and completes to four real edges is the print; the smallest
+        // such one, so a sheet of paper under the print is not taken.
+        if (!best || best.qual < 0.75) {
+          let alt = null;
+          for (const c of uniq.slice(0, 10)) {
+            if (best && c === best.c) continue;
+            if (!best && c.support < 0.3) continue;
+            if (best && insideFraction(best.q, c.q) < 0.5) continue;
+            const q = completeQuad(fm, grad, c.q);
+            const qual = quality(q);
+            if (qual < 0.75) continue;
+            const area = polyArea(q);
+            if (best && (insideFraction(best.q, q) < 0.9 || area < polyArea(best.q) * 1.05)) continue;
+            // Where it reaches beyond the first outline, its sides must run
+            // along edges all the way (not onto the surface's own lines).
+            if (best && !growsAlongEdges(fm, best.q, q)) continue;
+            if (!alt || area < alt.area) alt = { c, q, qual, area };
+          }
+          if (alt) best = alt;
+        }
+        chosen = best ? [{ ...best.c, q: best.q }] : [];
+      }
+
+      if (grad && chosen.length) {
         chosen = chosen.map((c) => {
-          // On album pages only a border on all four sides counts: the page
-          // around a print is a light band too, but it is page, not print.
-          const strict = multi;
-          let q = extendToPrintEdge(gray, c.q, { allSides: strict, grad });
-          // A second pass catches a white border beyond a bright sky.
-          if (!strict && q !== c.q) q = extendToPrintEdge(gray, q, { grad });
+          // A white border all round. On album pages this is the only white
+          // taken as part of a print: the page around it is light too.
+          const q = extendToBorder(gray, c.q);
           if (q === c.q) return c;
           const others = chosen.filter((o) => o !== c);
           if (others.some((o) => quadIoU(o.q, q) > 0.02)) return c;
@@ -849,22 +944,20 @@
     }
   }
 
-  /**
-   * A print's outer part can be white (a border, a bright sky, snow). On a
-   * light background that edge is too faint to detect, so the outline stops
-   * where the picture content starts. For each side, look outward: average
-   * the brightness along the whole side (which reveals very faint edges),
-   * walk across a smooth bright band, and find where it ends in a step or in
-   * the thin shadow line a print casts. Move the side out to that line.
-   *
-   * allSides: only extend when all four sides show such a band (a border),
-   * used on album pages where the page between prints is also a band.
-   */
   // Is side a->b a crisp straight edge along its whole length (the physical
   // edge of a print), rather than picture content such as a skyline?
-  function crispStraightSide(grad, a, b, n) {
+  function crispStraightSide(grad, a, b, n, minFrac) {
+    const f = sideEdgeFit(grad, a, b, n);
+    return f.frac >= (minFrac || 0.85) && f.sd <= 1.0 && (!!minFrac || f.med >= 20);
+  }
+
+  // The strongest edge near side a->b, sampled along it: the fraction of
+  // samples on a clear edge, how straight those are (residual spread about
+  // a fitted line, which may tilt a little against the side), and that
+  // line's offsets along n at both ends.
+  function sideEdgeFit(grad, a, b, n) {
     const { gx, gy, W, H } = grad;
-    const mags = [], offs = [];
+    const mags = [], offs = [], ts = [];
     for (let i = 0; i < 40; i++) {
       const t = 0.1 + 0.8 * i / 39;
       const bx = a[0] + (b[0] - a[0]) * t, by = a[1] + (b[1] - a[1]) * t;
@@ -875,16 +968,23 @@
         const v = Math.abs(gx[y * W + x] * n[0] + gy[y * W + x] * n[1]);
         if (v > best) { best = v; bo = o; }
       }
-      mags.push(best); offs.push(bo);
+      mags.push(best); offs.push(bo); ts.push(t);
     }
     const sorted = mags.slice().sort((x, y) => x - y);
     const med = sorted[sorted.length >> 1];
     const thr = Math.max(20, med * 0.5);
-    const strong = offs.filter((_, i) => mags[i] >= thr);
-    if (strong.length < mags.length * 0.85 || med < 20) return false;
-    const mean = strong.reduce((x, y) => x + y, 0) / strong.length;
-    const sd = Math.sqrt(strong.reduce((x, y) => x + (y - mean) * (y - mean), 0) / strong.length);
-    return sd <= 1.0;
+    const idx = [];
+    for (let i = 0; i < mags.length; i++) if (mags[i] >= thr) idx.push(i);
+    const frac = idx.length / mags.length;
+    if (idx.length < 4) return { frac, sd: Infinity, o0: 0, o1: 0, med };
+    let st = 0, so = 0, stt = 0, sto = 0;
+    for (const i of idx) { st += ts[i]; so += offs[i]; stt += ts[i] * ts[i]; sto += ts[i] * offs[i]; }
+    const k = idx.length, den = k * stt - st * st;
+    const slope = Math.abs(den) > 1e-9 ? (k * sto - st * so) / den : 0;
+    const icpt = (so - slope * st) / k;
+    let r2 = 0;
+    for (const i of idx) { const r = offs[i] - (icpt + slope * ts[i]); r2 += r * r; }
+    return { frac, sd: Math.sqrt(r2 / k), o0: icpt, o1: icpt + slope, med };
   }
 
   /**
@@ -935,11 +1035,8 @@
 
   // A thin dark line just outside a quad on some side: the shadow a print
   // casts on the surface it lies on. It is smooth along the side, unlike
-  // picture content; a printed border casts none. With gradients given the
-  // test is stricter, for outlines that may run along picture content: the
-  // side must be a crisp straight edge and the dark line a few pixels wide.
-  // The end of an uneven skyline under a white sky is neither.
-  function castsShadow(gray, quad, grad) {
+  // picture content; a printed border casts none.
+  function castsShadow(gray, quad) {
     const W = gray.cols, H = gray.rows, G = gray.data;
     const c = centroid(quad);
     for (let k = 0; k < 4; k++) {
@@ -969,13 +1066,8 @@
       // lighter away from a skyline) keeps rising and is not a shadow.
       if (Math.abs(v[18] - v[12]) > 2 || Math.abs(v[11] - far) > 3) continue;
       let near = Infinity;
-      for (let d = 2; d <= 8; d++) {
-        if (tex[d] > 7) continue;
-        // A shadow fades gently; the blurred edge climbs steeply.
-        if (grad && (tex[d + 1] > 7 || v[d + 1] > far - 3 || v[d + 1] - v[d] > 10)) continue;
-        if (v[d] < near) near = v[d];
-      }
-      if (far - near >= 6 && (!grad || crispStraightSide(grad, a, b, [nx, ny]))) return true;
+      for (let d = 2; d <= 8; d++) if (tex[d] <= 7 && v[d] < near) near = v[d];
+      if (far - near >= 6) return true;
     }
     return false;
   }
@@ -990,13 +1082,298 @@
     return out;
   }
 
-  function extendToPrintEdge(gray, quad, opts) {
-    opts = opts || {};
+  /**
+   * Smoothed brightness and colour channels with their gradients, for
+   * finding faint straight edges: averaged along a whole line, even a step
+   * of a couple of grey levels (white print on a white table) stands out.
+   */
+  function faintMaps(labCh, s) {
+    const val = [], gx = [], gy = [], mats = [];
+    let W = 0, H = 0;
+    for (let c = 0; c < 3; c++) {
+      const ch = s(labCh.get(c));
+      W = ch.cols; H = ch.rows;
+      const b = s(new cv.Mat()), dx = s(new cv.Mat()), dy = s(new cv.Mat());
+      cv.GaussianBlur(ch, b, new cv.Size(0, 0), 1.5);
+      cv.Sobel(b, dx, cv.CV_32F, 1, 0, 3);
+      cv.Sobel(b, dy, cv.CV_32F, 0, 1, 3);
+      mats.push([b, dx, dy]);
+    }
+    // Views are taken after every allocation, so none of them goes stale;
+    // the caller keeps the Mats alive and allocates nothing while using them.
+    for (const [b, dx, dy] of mats) { val.push(b.data); gx.push(dx.data32F); gy.push(dy.data32F); }
+    return { W, H, val, gx, gy };
+  }
+
+  // Colour channels count double: a white print and a white table often
+  // differ more in tint than in brightness.
+  const CH_WEIGHT = [1, 2, 2];
+
+  // Edge strength across line p0->p1 in `m` pieces: for each piece the mean
+  // gradient along the normal n, so noise and texture cancel while a
+  // straight edge adds up. The sign may change between pieces (a cloudy
+  // sky is lighter than the table in places and darker in others).
+  function lineContrast(fm, p0, p1, n, m) {
+    const { W, H, gx, gy } = fm;
+    const len = Math.hypot(p1[0] - p0[0], p1[1] - p0[1]);
+    const N = Math.max(m * 4, Math.round(len / 2));
+    const sums = new Float32Array(m * 3), cnt = new Int32Array(m);
+    for (let i = 0; i < N; i++) {
+      const t = 0.03 + 0.94 * (i + 0.5) / N;
+      const x = Math.round(p0[0] + (p1[0] - p0[0]) * t), y = Math.round(p0[1] + (p1[1] - p0[1]) * t);
+      if (x < 1 || y < 1 || x >= W - 1 || y >= H - 1) continue;
+      const j = Math.min(m - 1, Math.floor(i * m / N));
+      const o = y * W + x;
+      for (let c = 0; c < 3; c++) sums[j * 3 + c] += gx[c][o] * n[0] + gy[c][o] * n[1];
+      cnt[j]++;
+    }
+    const out = new Float32Array(m);
+    for (let j = 0; j < m; j++) {
+      if (cnt[j] < 2) { out[j] = 0; continue; }
+      let best = 0;
+      for (let c = 0; c < 3; c++) best = Math.max(best, CH_WEIGHT[c] * Math.abs(sums[j * 3 + c] / cnt[j]));
+      out[j] = best;
+    }
+    return out;
+  }
+
+  // Pieces of line p0->p1 that lie on a real edge: strong enough, and
+  // stronger right on the line than a few pixels to either side (texture
+  // and wood grain crossing the line are not).
+  function edgeHits(fm, p0, p1, n, m, tau) {
+    const c0 = lineContrast(fm, p0, p1, n, m);
+    let rough = 0;
+    for (let j = 0; j < m; j++) if (c0[j] >= tau) rough++;
+    if (rough < m * 0.6) return { hits: rough, c0 };
+    const sh = (d) => lineContrast(fm, [p0[0] + n[0] * d, p0[1] + n[1] * d], [p1[0] + n[0] * d, p1[1] + n[1] * d], n, m);
+    const cp = sh(4), cm = sh(-4);
+    let hits = 0;
+    for (let j = 0; j < m; j++) if (c0[j] >= tau && c0[j] >= Math.max(cp[j], cm[j])) hits++;
+    return { hits, c0 };
+  }
+
+  // Does a side continue along an edge from a to b? The line may be off
+  // by a pixel or two that far out, so it may pivot slightly around a. The
+  // stretch next to b must show the edge too: most of a long extension may
+  // still run along the print's real edge.
+  function edgeRunOk(fm, a, b, n, tau) {
+    const len = Math.hypot(b[0] - a[0], b[1] - a[1]);
+    if (len < 6) return true;
+    const m = Math.max(2, Math.min(8, Math.round(len / 12)));
+    const mid = [a[0] + (b[0] - a[0]) * 0.6, a[1] + (b[1] - a[1]) * 0.6];
+    const m2 = Math.max(2, Math.round(m * 0.4));
+    for (let o = -3; o <= 3; o += 1) {
+      const e = [b[0] + n[0] * o, b[1] + n[1] * o];
+      const s0 = [mid[0] + n[0] * o * 0.6, mid[1] + n[1] * o * 0.6];
+      if (edgeHits(fm, a, e, n, m, tau).hits >= m * 0.4 && edgeHits(fm, s0, e, n, m2, tau).hits >= m2 * 0.5) return true;
+    }
+    return false;
+  }
+
+  // Colour and texture of the strip just beyond line p0->p1, in m pieces.
+  function stripStats(fm, p0, p1, n, m, d0, d1) {
+    const { W, H, val, gx, gy } = fm;
+    const out = [];
+    for (let j = 0; j < m; j++) {
+      let L = 0, A = 0, B = 0, T = 0, c = 0;
+      for (let i = 0; i < 6; i++) {
+        const t = 0.03 + 0.94 * (j + (i + 0.5) / 6) / m;
+        const bx = p0[0] + (p1[0] - p0[0]) * t, by = p0[1] + (p1[1] - p0[1]) * t;
+        for (let d = d0; d <= d1; d += 2) {
+          const x = Math.round(bx + n[0] * d), y = Math.round(by + n[1] * d);
+          if (x < 1 || y < 1 || x >= W - 1 || y >= H - 1) continue;
+          const o = y * W + x;
+          L += val[0][o]; A += val[1][o]; B += val[2][o];
+          T += Math.abs(gx[0][o]) + Math.abs(gy[0][o]);
+          c++;
+        }
+      }
+      out.push(c ? { L: L / c, A: A / c, B: B / c, T: T / c } : null);
+    }
+    return out;
+  }
+
+  // Every corner of `outer` that lies beyond `inner`: both sides meeting
+  // there follow an edge from level with the inner outline to the corner.
+  function growsAlongEdges(fm, inner, outer) {
+    const co = centroid(outer);
+    for (let k = 0; k < 4; k++) {
+      const p = outer[k];
+      if (pointInQuad(p, inner)) continue;
+      // Nearest point of the inner outline to this corner.
+      let near = null, nd = Infinity;
+      for (let j = 0; j < 4; j++) {
+        const a = inner[j], b = inner[(j + 1) % 4];
+        const dx = b[0] - a[0], dy = b[1] - a[1];
+        const t = Math.max(0, Math.min(1, ((p[0] - a[0]) * dx + (p[1] - a[1]) * dy) / (dx * dx + dy * dy || 1)));
+        const c = [a[0] + dx * t, a[1] + dy * t];
+        const d = Math.hypot(c[0] - p[0], c[1] - p[1]);
+        if (d < nd) { nd = d; near = c; }
+      }
+      if (nd < 6) continue;
+      for (const other of [outer[(k + 3) % 4], outer[(k + 1) % 4]]) {
+        // Along this side, from level with that point to the corner.
+        const dx = other[0] - p[0], dy = other[1] - p[1], L = Math.hypot(dx, dy) || 1;
+        const along = Math.max(0, ((near[0] - p[0]) * dx + (near[1] - p[1]) * dy) / L);
+        if (along < 6) continue;
+        const start = [p[0] + dx / L * along, p[1] + dy / L * along];
+        if (!edgeRunOk(fm, start, p, outwardNormal(p, other, co), 5)) return false;
+      }
+    }
+    return true;
+  }
+
+  function outwardNormal(a, b, c) {
+    const len = Math.hypot(b[0] - a[0], b[1] - a[1]) || 1;
+    let n = [-(b[1] - a[1]) / len, (b[0] - a[0]) / len];
+    if (((a[0] + b[0]) / 2 - c[0]) * n[0] + ((a[1] + b[1]) / 2 - c[1]) * n[1] < 0) n = [-n[0], -n[1]];
+    return n;
+  }
+
+  /**
+   * Complete an outline that stops short of the print's real edge where part
+   * of the picture is white (a sky, a shirt, a white background) on a light
+   * surface. There the print's edge is faint and the outline follows the
+   * picture content instead: along a skyline, or cutting a corner with a
+   * diagonal. The print's other edges are still crisp straight lines, so
+   * each side that is not one is searched for again: a new side with its
+   * ends on the neighbouring sides' lines (extended), along a faint but
+   * straight edge, with the surface beyond it. The neighbouring sides must
+   * continue along an edge up to the new corners too, which keeps the
+   * outline off lines on the table (another object, the grain of wood).
+   */
+  function completeQuad(fm, grad, quad) {
+    const { W, H } = fm;
+    const minDim = Math.min(W, H);
+    const tau = 5;
+    const M = 8;
+    let q = quad.map((p) => p.slice());
+    const solid = (qq, k, frac) => crispStraightSide(grad, qq[k], qq[(k + 1) % 4], outwardNormal(qq[k], qq[(k + 1) % 4], centroid(qq)), frac);
+    // A side that is a crisp straight edge for a good part of its length
+    // lies on the print's edge: it stays, and can guide its neighbours.
+    const reliable = (qq, k) => solid(qq, k, 0.3);
+    // Put each side that follows a straight edge exactly on it: the sides
+    // guide the search, so small errors would grow far out.
+    {
+      const cq = centroid(q);
+      const lines = [];
+      for (let k = 0; k < 4; k++) {
+        const a = q[k], b = q[(k + 1) % 4], n = outwardNormal(a, b, cq);
+        const f = sideEdgeFit(grad, a, b, n);
+        const on = f.frac >= 0.3 && f.sd <= 1.0;
+        const p0 = on ? [a[0] + n[0] * f.o0, a[1] + n[1] * f.o0] : a;
+        const p1 = on ? [b[0] + n[0] * f.o1, b[1] + n[1] * f.o1] : b;
+        lines.push({ p: p0, d: [p1[0] - p0[0], p1[1] - p0[1]] });
+      }
+      const snapped = [];
+      for (let k = 0; k < 4; k++) {
+        const l1 = lines[(k + 3) % 4], l2 = lines[k];
+        const pt = intersectLines(l1.p, l1.d, l2.p, l2.d);
+        snapped.push(pt && Math.hypot(pt[0] - q[k][0], pt[1] - q[k][1]) < 12 ? pt : q[k]);
+      }
+      if (isConvexQuad(snapped)) q = snapped;
+    }
+    const solids = [0, 1, 2, 3].map((k) => solid(q, k));
+    if (solids.every(Boolean) || !solids.some(Boolean)) return quad;
+    // What the surface looks like: just beyond the crisp sides.
+    const ref = [];
+    for (let k = 0; k < 4; k++) {
+      if (!solids[k]) continue;
+      const a = q[k], b = q[(k + 1) % 4];
+      for (const st of stripStats(fm, a, b, outwardNormal(a, b, centroid(q)), M, 5, 13)) if (st) ref.push(st);
+    }
+    if (ref.length < 4) return quad;
+    const med = (key) => { const v = ref.map((r) => r[key]).sort((x, y) => x - y); return v[v.length >> 1]; };
+    const sL = med('L'), sA = med('A'), sB = med('B'), sT = med('T');
+    const isSurface = (st) => st && Math.abs(st.L - sL) <= Math.max(14, sL * 0.12) &&
+      Math.abs(st.A - sA) <= 6 && Math.abs(st.B - sB) <= 6 && st.T <= Math.max(24, sT * 2.5);
+    // A straight run of edge along a neighbour's extension, if long enough.
+    const edgeRun = (a, b, n) => edgeRunOk(fm, a, b, n, tau);
+    const angleBetween = (d1, d2) => {
+      const a = Math.abs(Math.atan2(d1[0] * d2[1] - d1[1] * d2[0], d1[0] * d2[0] + d1[1] * d2[1])) * 180 / Math.PI;
+      return Math.min(a, 180 - a);
+    };
+    const order = [0, 1, 2, 3].filter((k) => !solids[k] && !reliable(q, k));
+    for (const k of order) {
+      const c0 = q[(k + 3) % 4], c1 = q[k], c2 = q[(k + 1) % 4], c3 = q[(k + 2) % 4];
+      // Only neighbours that are real edges can guide the new side.
+      if (!reliable(q, (k + 3) % 4) || !reliable(q, (k + 1) % 4)) continue;
+      const cen = centroid(q);
+      const len1 = Math.hypot(c1[0] - c0[0], c1[1] - c0[1]), len2 = Math.hypot(c2[0] - c3[0], c2[1] - c3[1]);
+      const e1 = [(c1[0] - c0[0]) / len1, (c1[1] - c0[1]) / len1], e2 = [(c2[0] - c3[0]) / len2, (c2[1] - c3[1]) / len2];
+      const n1 = outwardNormal(c0, c1, cen), n2 = outwardNormal(c3, c2, cen);
+      const max1 = Math.min(len1 * 2.5, minDim * 0.6), max2 = Math.min(len2 * 2.5, minDim * 0.6);
+      const lo1 = -len1 * 0.05, lo2 = -len2 * 0.05;
+      const step = Math.max(1.5, Math.max(max1 - lo1, max2 - lo2) / 70);
+      const at = (c, e, u) => [c[0] + e[0] * u, c[1] + e[1] * u];
+      const inFrame = (p) => p[0] >= 1 && p[1] >= 1 && p[0] <= W - 2 && p[1] <= H - 2;
+      // Opposite sides of a print are close to parallel, even in perspective.
+      const opp = [c3[0] - c0[0], c3[1] - c0[1]];
+      const evalLine = (u1, u2, full) => {
+        const p1 = at(c1, e1, u1), p2 = at(c2, e2, u2);
+        if (!inFrame(p1) || !inFrame(p2)) return null;
+        if (angleBetween([p2[0] - p1[0], p2[1] - p1[1]], opp) > 14) return null;
+        const n = outwardNormal(p1, p2, cen);
+        const { hits: hit, c0: con } = edgeHits(fm, p1, p2, n, M, tau);
+        if (hit < M * 0.75) return null;
+        let sum = 0;
+        for (let j = 0; j < M; j++) sum += Math.min(con[j], tau * 3);
+        if (!full) return { p1, p2, n, hit, sum };
+        // A print's edge is a step between two different surfaces; a thin
+        // line (wood grain, a crease) has the same on both sides.
+        const outer = stripStats(fm, p1, p2, n, M, 5, 11), inner = stripStats(fm, p1, p2, n, M, -11, -5);
+        let steps = 0;
+        for (let j = 0; j < M; j++) {
+          const o = outer[j], i = inner[j];
+          if (o && i && Math.max(Math.abs(o.L - i.L), 2 * Math.abs(o.A - i.A), 2 * Math.abs(o.B - i.B)) >= 2) steps++;
+        }
+        if (steps < M * 0.6) return null;
+        const beyond = stripStats(fm, p1, p2, n, M, 4, 10);
+        const surf = beyond.filter(isSurface).length;
+        if (surf < M * 0.6) return null;
+        return { p1, p2, n, hit, sum, surf };
+      };
+      let best = null;
+      for (let u1 = lo1; u1 <= max1; u1 += step) {
+        for (let u2 = lo2; u2 <= max2; u2 += step) {
+          const r = evalLine(u1, u2, true);
+          if (!r) continue;
+          // The outermost line that qualifies: the print ends there.
+          const area = polyArea([c0, r.p1, r.p2, c3]);
+          if (!best || area > best.area) best = { ...r, u1, u2, area };
+        }
+      }
+      if (!best) continue;
+      // Settle on the strongest edge right there.
+      let fine = best;
+      for (let d1 = -step; d1 <= step; d1 += 0.5) {
+        for (let d2 = -step; d2 <= step; d2 += 0.5) {
+          const r = evalLine(best.u1 + d1, best.u2 + d2, false);
+          if (r && r.sum > fine.sum) fine = { ...r, u1: best.u1 + d1, u2: best.u2 + d2 };
+        }
+      }
+      const { u1, u2 } = fine;
+      if (u1 < 3 && u2 < 3) continue;
+      // The neighbouring sides must carry on to the new corners.
+      if (u1 > 0 && !edgeRun(c1, fine.p1, n1)) continue;
+      if (u2 > 0 && !edgeRun(c2, fine.p2, n2)) continue;
+      const nq = q.slice();
+      nq[k] = fine.p1; nq[(k + 1) % 4] = fine.p2;
+      if (!isConvexQuad(nq) || quadAngles(nq).some((a) => a < 50 || a > 130)) continue;
+      q = nq;
+    }
+    return q;
+  }
+
+  /**
+   * A print's white border on a light background: its outer edge is too
+   * faint for the outline, which stops at the picture. When all four sides
+   * show a light, smooth band of similar width that ends in a step or in the
+   * thin shadow line a print casts, move the sides out to it.
+   */
+  function extendToBorder(gray, quad) {
     // A print casting a shadow is lying on the light surface around it.
-    const grad = opts.grad || gradients(gray);
-    // Album pages only extend a border on all four sides, so any hint of a
-    // shadow counts there.
-    if (castsShadow(gray, quad, opts.allSides ? null : grad)) return quad;
+    if (castsShadow(gray, quad)) return quad;
     const W = gray.cols, H = gray.rows, G = gray.data;
     const c = centroid(quad);
     const minDim = Math.min(W, H);
@@ -1005,54 +1382,31 @@
       const xi = Math.round(x), yi = Math.round(y);
       return xi >= 0 && yi >= 0 && xi < W && yi < H ? G[yi * W + xi] : -1;
     };
-    // Width of the light band beyond side a-b, measured on the stretch
-    // t0..t1 of the side; 0 when there is none.
-    const bandWidth = (a, b, nx, ny, D, across, t0, t1) => {
-      // Brightness profile across the side, averaged along it. It stops at
-      // the frame edge.
-      const N = Math.round(50 * (t1 - t0) / 0.7);
+    // Width of the light band beyond side a-b; 0 when there is none.
+    const bandWidth = (a, b, nx, ny, D) => {
+      // Brightness profile across the side, averaged along it (which
+      // reveals very faint edges). It stops at the frame edge.
       const v = new Float32Array(D + 1), tex = new Float32Array(D + 1);
       for (let d = 0; d <= D; d++) {
         let sum = 0, cnt = 0, tsum = 0, prev = -1;
-        for (let i = 0; i < N; i++) {
-          const t = t0 + (t1 - t0) * i / (N - 1);
+        for (let i = 0; i < 50; i++) {
+          const t = 0.15 + 0.7 * i / 49;
           const g = px(a[0] + (b[0] - a[0]) * t + nx * d, a[1] + (b[1] - a[1]) * t + ny * d);
           if (g < 0) continue;
           sum += g; cnt++;
           if (prev >= 0) tsum += Math.abs(g - prev);
           prev = g;
         }
-        if (cnt < N * 0.7) { D = d - 1; break; }
+        if (cnt < 35) { D = d - 1; break; }
         v[d] = sum / cnt;
         tex[d] = tsum / Math.max(1, cnt - 1);
       }
       if (D <= eMin + 6) return 0;
       const sv = new Float32Array(D + 1);
       for (let d = 0; d <= D; d++) sv[d] = (v[Math.max(0, d - 1)] + 2 * v[d] + v[Math.min(D, d + 1)]) / 4;
-      // Along picture content the outline may sit just inside an uneven
-      // skyline (treetops, roofs): skip that textured fringe to where the
-      // smooth light band starts. A shadow or plain surface is not textured,
-      // so it is never skipped.
-      let d = 2;
-      if (tex[2] > 7 || tex[3] > 7) {
-        const maxSkip = Math.min(D - 12, Math.round(across * 0.15) + 5);
-        let found = -1;
-        for (let s0 = 3; s0 <= maxSkip && found < 0; s0++) {
-          let ok = true;
-          for (let j = s0; j < s0 + 6; j++) if (tex[j] > 7 || sv[j] < 150 || Math.abs(sv[j + 1] - sv[j]) > 2.5) { ok = false; break; }
-          if (ok) found = s0;
-        }
-        if (found < 0) return 0;
-        d = found;
-      } else {
-        // The outline can sit on the blurred edge where a sky begins: step
-        // over that short climb into it. Not on album pages, where the
-        // climb may hold a faint shadow.
-        while (!opts.allSides && d < 6 && sv[d + 1] - sv[d] > 2.5) d++;
-      }
       // Walk across the band while it stays light and smooth; stop at any
       // dip below it (a print's shadow line) or a jump.
-      let top = sv[d];
+      let d = 2, top = sv[d];
       while (d < D - 4 && sv[d] >= 150 && tex[d] <= 7 && Math.abs(sv[d + 1] - sv[d]) <= 2.5 && sv[d + 1] >= top - 3) {
         d++;
         if (sv[d] > top) top = sv[d];
@@ -1062,70 +1416,33 @@
       let best = 0, bestE = -1;
       for (let e = d; e <= Math.min(D - 3, d + 6); e++) {
         const before = sv[e - 3], after = sv[e + 3];
-        const step = before - after;
-        const dip = Math.min(before, after) - sv[e];
-        const strength = Math.max(step, dip * 1.5);
+        const strength = Math.max(before - after, (Math.min(before, after) - sv[e]) * 1.5);
         if (strength > best) { best = strength; bestE = e; }
       }
       return best >= 5 && bestE > 0 ? bestE : 0;
     };
     const widths = [];
     const lines = [];
-    const tilted = [];
     for (let k = 0; k < 4; k++) {
       const a = quad[k], b = quad[(k + 1) % 4];
       const len = Math.hypot(b[0] - a[0], b[1] - a[1]) || 1;
-      let nx = -(b[1] - a[1]) / len, ny = (b[0] - a[0]) / len;
+      const n = outwardNormal(a, b, c);
       const mx = (a[0] + b[0]) / 2, my = (a[1] + b[1]) / 2;
-      if ((mx - c[0]) * nx + (my - c[1]) * ny < 0) { nx = -nx; ny = -ny; }
-      // How far the opposite side is: a white part is at most a fraction of it.
+      // A border is a small fraction of the print.
       const o1 = quad[(k + 2) % 4], o2 = quad[(k + 3) % 4];
       const across = Math.hypot(mx - (o1[0] + o2[0]) / 2, my - (o1[1] + o2[1]) / 2);
-      const D = Math.round(opts.allSides ? Math.min(across * 0.2, minDim * 0.25) : Math.min(across * 1.2, minDim * 0.45));
-      lines.push({ a, dir: [(b[0] - a[0]) / len, (b[1] - a[1]) / len], n: [nx, ny] });
-      tilted.push(null);
-      if (D <= eMin + 6) { widths.push(0); continue; }
-      // An outline along a skyline can run at a slant to the print's edge,
-      // which blurs the edge in a profile along the whole side. Each half is
-      // measured on its own too, so the new side can tilt.
-      const w1 = bandWidth(a, b, nx, ny, D, across, 0.15, 0.5);
-      const w2 = bandWidth(a, b, nx, ny, D, across, 0.5, 0.85);
-      if (w1 && w2 && Math.abs(w1 - w2) < len * 0.35 * 0.5) {
-        tilted[k] = [0.325, w1, 0.675, w2];
-        widths.push((w1 + w2) / 2);
-      } else {
-        widths.push(bandWidth(a, b, nx, ny, D, across, 0.15, 0.85));
-      }
+      const D = Math.round(Math.min(across * 0.2, minDim * 0.25));
+      lines.push({ a, dir: [(b[0] - a[0]) / len, (b[1] - a[1]) / len], n });
+      widths.push(D <= eMin + 6 ? 0 : bandWidth(a, b, n[0], n[1], D));
     }
-    const ext = widths.filter((w) => w > 0);
-    if (!ext.length) return quad;
     // A band of similar width on all four sides is a border.
-    const border = ext.length === 4 && Math.max(...ext) <= Math.min(...ext) * 4;
-    if (opts.allSides && !border) return quad;
-    if (!border) {
-      // Otherwise only extend across picture content (a skyline, a bright
-      // window), never past a crisp straight edge: that is the print's own
-      // edge, and the white beyond it is the surface it lies on.
-      for (let k = 0; k < 4; k++) {
-        if (!widths[k]) continue;
-        const a = quad[k], b = quad[(k + 1) % 4];
-        if (crispStraightSide(grad, a, b, lines[k].n)) widths[k] = 0;
-      }
-      if (!widths.some((w) => w > 0)) return quad;
-    }
-    const moved = lines.map((l, k) => {
-      const b = quad[(k + 1) % 4];
-      const at = (t, w) => [l.a[0] + (b[0] - l.a[0]) * t + l.n[0] * w, l.a[1] + (b[1] - l.a[1]) * t + l.n[1] * w];
-      if (!widths[k] || !tilted[k]) return { p: at(0, widths[k]), d: l.dir };
-      const [t1, w1, t2, w2] = tilted[k];
-      const p1 = at(t1, w1), p2 = at(t2, w2);
-      const dl = Math.hypot(p2[0] - p1[0], p2[1] - p1[1]) || 1;
-      return { p: p1, d: [(p2[0] - p1[0]) / dl, (p2[1] - p1[1]) / dl] };
-    });
+    if (!widths.every((w) => w > 0) || Math.max(...widths) > Math.min(...widths) * 4) return quad;
     const out = [];
     for (let k = 0; k < 4; k++) {
-      const l1 = moved[(k + 3) % 4], l2 = moved[k];
-      const pt = intersectLines(l1.p, l1.d, l2.p, l2.d);
+      const l1 = lines[(k + 3) % 4], l2 = lines[k];
+      const p1 = [l1.a[0] + l1.n[0] * widths[(k + 3) % 4], l1.a[1] + l1.n[1] * widths[(k + 3) % 4]];
+      const p2 = [l2.a[0] + l2.n[0] * widths[k], l2.a[1] + l2.n[1] * widths[k]];
+      const pt = intersectLines(p1, l1.dir, p2, l2.dir);
       if (!pt) return quad;
       out.push(pt);
     }

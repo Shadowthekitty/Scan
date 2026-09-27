@@ -197,7 +197,9 @@ function processFrames(mats, opts, progress) {
     found = found.map((q) => (detected ? P.refineQuad(ref, q) : q));
 
     const [bx0, by0, bx1, by1] = bboxOf(found);
-    const margin = Math.max(bx1 - bx0, by1 - by0) * 0.06 + 8;
+    // Keep room around the outline so Crop can still reach a part of the
+    // print that detection left out (a white edge on a white table).
+    const margin = Math.max(bx1 - bx0, by1 - by0) * (found.length > 1 ? 0.06 : 0.15) + 8;
     const roi = clampRect(bx0 - margin, by0 - margin, bx1 + margin, by1 + margin, W, H);
 
     let merged;
@@ -229,7 +231,7 @@ function processFrames(mats, opts, progress) {
       if (found.length > 1) {
         // Each photo of an album page gets its own base with a margin.
         const [x0, y0, x1, y1] = bboxOf([local]);
-        const mg = Math.max(x1 - x0, y1 - y0) * 0.06 + 8;
+        const mg = Math.max(x1 - x0, y1 - y0) * 0.1 + 8;
         const r = clampRect(x0 - mg, y0 - mg, x1 + mg, y1 + mg, merged.cols, merged.rows);
         base = P.copyMat(merged.roi(new cv.Rect(r.x, r.y, r.w, r.h)));
         quad = local.map((p) => [p[0] - r.x, p[1] - r.y]);

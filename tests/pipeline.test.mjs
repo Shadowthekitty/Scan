@@ -351,3 +351,84 @@ test('keeps white parts of a print on a light surface', () => {
     scene.delete();
   }
 });
+
+// Uneven light, lens blur and sensor noise, as in a phone photo.
+function phoneCamera(scene, r) {
+  const W = scene.cols, H = scene.rows, d = scene.data;
+  for (let y = 0; y < H; y++) {
+    for (let x = 0; x < W; x++) {
+      const g = 1 + 0.07 * ((x / W - 0.5) + (y / H - 0.5)) - 0.2 * ((x / W - 0.5) ** 2 + (y / H - 0.5) ** 2);
+      const o = (y * W + x) * 4;
+      for (let c = 0; c < 3; c++) d[o + c] = d[o + c] * g;
+    }
+  }
+  cv.GaussianBlur(scene, scene, new cv.Size(0, 0), 0.9);
+  const e = scene.data;
+  for (let o = 0; o < e.length; o += 4) { const n = (r() - 0.5) * 8; e[o] += n; e[o + 1] += n; e[o + 2] += n; }
+}
+
+test('finds a corner hidden by a white shirt on a white table', () => {
+  // A white shirt covers the print's lower left corner; there the print's
+  // edge barely differs from the table. The outline must not cut across.
+  const q = [[330, 250], [1290, 268], [1276, 925], [318, 902]];
+  for (const seed of [1, 2, 3]) {
+    const table = new cv.Mat(1200, 1600, cv.CV_8UC4, new cv.Scalar(236, 234, 229, 255));
+    const photo = makePhoto(cv, 900, 600, 50 + seed);
+    const d = photo.data;
+    for (let y = 0; y < 600; y++) {
+      for (let x = 0; x < 900; x++) {
+        if ((x / 430) ** 2 + ((600 - y) / 330) ** 2 > 1) continue;
+        // Folds: soft shading across the shirt.
+        const v = 248 * (0.84 + 0.08 * Math.sin(x / 37 + y / 53) + 0.06 * Math.sin(y / 29 - x / 61));
+        const o = (y * 900 + x) * 4;
+        d[o] = v; d[o + 1] = v; d[o + 2] = v + 2;
+      }
+    }
+    const scene = placePhoto(cv, table, photo, q);
+    table.delete(); photo.delete();
+    phoneCamera(scene, rng(seed));
+    const f = P.detectQuads(scene, { workSize: 640 });
+    const ratio = P.polyArea(P.refineQuad(scene, f[0].pts)) / P.polyArea(q);
+    // The same at live preview size.
+    const small = new cv.Mat();
+    cv.resize(scene, small, new cv.Size(400, 300), 0, 0, cv.INTER_AREA);
+    const fl = P.detectQuads(small, { workSize: 400, minSupport: 0.5 });
+    const lratio = fl.length ? P.polyArea(fl[0].pts.map((p) => [p[0] * 4, p[1] * 4])) / P.polyArea(q) : 0;
+    console.log(`white shirt (${seed}): outline covers ${(ratio * 100).toFixed(0)}% of the print, live ${(lratio * 100).toFixed(0)}%`);
+    assert.ok(ratio > 0.97 && ratio < 1.03, 'whole print kept');
+    assert.ok(lratio > 0.95 && lratio < 1.05, 'whole print kept live');
+    small.delete(); scene.delete();
+  }
+});
+
+test('does not grow onto lines of the surface', () => {
+  // A print whose lower part is close to the wood it lies on, with grain
+  // lines parallel to its bottom edge. The outline must stay on the print.
+  const q = [[330, 250], [1290, 262], [1280, 915], [322, 900]];
+  for (const seed of [1, 2, 4]) {
+    const r = rng(seed + 20);
+    const W = 1600, H = 1200;
+    const table = new cv.Mat(H, W, cv.CV_8UC4, new cv.Scalar(214, 190, 160, 255));
+    const td = table.data;
+    const dark = new Float32Array(H);
+    for (let i = 0; i < 40; i++) {
+      const y0 = r() * H, depth = 10 + r() * 20;
+      for (let y = 0; y < H; y++) dark[y] += depth * Math.exp(-((y - y0) ** 2) / 8);
+    }
+    for (let y = 0; y < H; y++) {
+      for (let x = 0; x < W; x++) {
+        const o = (y * W + x) * 4, n = (r() - 0.5) * 4 - dark[y];
+        td[o] += n; td[o + 1] += n; td[o + 2] += n;
+      }
+    }
+    const photo = makePhoto(cv, 900, 600, 60 + seed);
+    cv.rectangle(photo, new cv.Point(0, 470), new cv.Point(900, 600), new cv.Scalar(150, 140, 125, 255), -1);
+    const scene = placePhoto(cv, table, photo, q);
+    table.delete(); photo.delete();
+    const f = P.detectQuads(scene, { workSize: 640 });
+    const ratio = P.polyArea(P.refineQuad(scene, f[0].pts)) / P.polyArea(q);
+    console.log(`print on grained wood (${seed}): outline covers ${(ratio * 100).toFixed(0)}% of the print`);
+    assert.ok(ratio > 0.97 && ratio < 1.03, 'stayed on the print');
+    scene.delete();
+  }
+});

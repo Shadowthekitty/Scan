@@ -9,7 +9,7 @@ import { defaultParams, saveDoc } from './saver.js';
 import { getScan, requestPersistence, storageEstimate, listScans, deleteScan } from './db.js';
 
 const VIEWS = ['library', 'capture', 'review', 'editor', 'viewer'];
-export const APP_VERSION = '1.4';
+export const APP_VERSION = '1.5';
 
 class App {
   constructor() {
