@@ -106,6 +106,15 @@ WebAssembly. The steps are:
    tables. Blown-out glare is masked out, and the first shot waits until the
    phone is steady after you tap. `tests/tracking.test.mjs` checks this on a
    simulated handheld phone.
+   On a phone, tracking results arrive a few times per second and describe
+   a frame that is already a moment old. So the gyroscope moves the dots
+   and outline with the phone between results and through short dropouts.
+   It also gives the tracker a head start on fast moves, and rules out
+   re-anchoring to a place the phone cannot have turned to. How rotation
+   moves the picture differs between phones and browsers (axes, units, lens,
+   sensor delay), so this is learned from the tracker's own results as you
+   move, and remembered (`js/motion.js`, `tests/motion.test.mjs`). Without a
+   gyroscope, or if permission is refused, tracking works as before.
 3. **Alignment.** ORB matching with RANSAC, then refinement with pyramidal
    Lucas-Kanade flow, lands each extra shot on the first to about a pixel.
 4. **Glare merge.** Exposure is matched per channel. Glare only adds light, so
@@ -143,6 +152,7 @@ npm test
 | `js/pipeline.js` | All image processing; shared by the worker and the tests |
 | `js/worker.js` | Worker that owns OpenCV, captured frames and open edits |
 | `js/capture.js`, `js/camera.js` | Camera screen, live outline, guided glare shots |
+| `js/motion.js` | Gyroscope: keeps the guide dots in place between tracking results |
 | `js/editor.js`, `js/saver.js` | Editor and saving |
 | `js/library.js`, `js/db.js` | Library, viewer, album review, storage |
 | `js/exif.js`, `js/zip.js` | EXIF writer (date taken, caption) and ZIP export |

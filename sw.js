@@ -23,6 +23,7 @@ const SHELL = [
   'js/editor.js',
   'js/exif.js',
   'js/library.js',
+  'js/motion.js',
   'js/pipeline.js',
   'js/saver.js',
   'js/settings.js',

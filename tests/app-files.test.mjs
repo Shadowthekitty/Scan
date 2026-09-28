@@ -20,3 +20,14 @@ test('every offline file exists', () => {
   assert.ok(list.length > 15, 'file list found');
   for (const f of list) assert.ok(fs.existsSync(path.join(root, f)), `${f} exists`);
 });
+
+test('every app module is available offline', () => {
+  const sw = fs.readFileSync(path.join(root, 'sw.js'), 'utf8');
+  const js = fs.readdirSync(path.join(root, 'js')).filter((f) => f.endsWith('.js'));
+  for (const f of js) {
+    const src = fs.readFileSync(path.join(root, 'js', f), 'utf8');
+    for (const m of src.matchAll(/(?:import|from)\s*\(?\s*'\.\/([^']+\.js)'/g)) {
+      assert.ok(sw.includes(`'js/${m[1]}'`), `js/${m[1]} (used by js/${f}) is in the offline list`);
+    }
+  }
+});

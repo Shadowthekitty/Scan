@@ -2,6 +2,7 @@
 import { Camera } from './camera.js';
 import { $, toast, showBusy, hideBusy, vibrate } from './util.js';
 import { getSettings, setSetting } from './settings.js';
+import { Gyro, mul3 } from './motion.js';
 
 const LIVE_SIZE = 400;
 const LIVE_SIZE_ALBUM = 560;
@@ -55,6 +56,7 @@ export class CaptureView {
     this.hintEl = $('#cam-hint');
     this.progressEl = $('#cam-progress');
     this.camera = new Camera(this.video);
+    this.gyro = new Gyro();
     this.state = 'off';
     this.quads = [];
     this.missed = 0;
@@ -116,6 +118,7 @@ export class CaptureView {
 
   async open() {
     this.syncToggles();
+    this.stopGyro();
     this.state = 'starting';
     this.quads = [];
     this.tracks = [];
@@ -154,6 +157,7 @@ export class CaptureView {
 
   close() {
     this.state = 'off';
+    this.stopGyro();
     this.running = false;
     cancelAnimationFrame(this.raf);
     this.camera.stop();
@@ -318,14 +322,16 @@ export class CaptureView {
       const r = this.displayRect();
       const cx = r.x + r.w / 2, cy = r.y + r.h / 2;
       const R = Math.min(r.w, r.h) * 0.085;
-      const recent = this.H && (this.trackOk || performance.now() - this.lastTrackOk < TRACK_GRACE_MS);
+      const now = performance.now();
+      const recent = this.H && (this.trackOk || now - this.lastTrackOk < TRACK_GRACE_MS);
       if (recent) {
-        const outline = this.guideQuad.map((p) => this.toScreen([applyH(this.H, p)[0] / this.trackW, applyH(this.H, p)[1] / this.trackH]));
+        const Hd = this.currentH(now);
+        const outline = this.guideQuad.map((p) => { const q = applyH(Hd, p); return this.toScreen([q[0] / this.trackW, q[1] / this.trackH]); });
         this.drawQuad(outline, dpr, this.trackOk ? 0.45 : 0.2);
         ctx.globalAlpha = this.trackOk ? 1 : 0.45;
         for (const d of this.dots) {
           if (d.done) continue;
-          const q = applyH(this.H, d.p);
+          const q = applyH(Hd, d.p);
           const s = this.toScreen([q[0] / this.trackW, q[1] / this.trackH]);
           d.screen = s;
           ctx.beginPath();
@@ -412,6 +418,8 @@ export class CaptureView {
   }
 
   async startScan() {
+    // iPhones only share motion sensors after asking, from a tap.
+    if (getSettings().glare) Gyro.requestPermission();
     this.state = 'capturing';
     // Tapping the button jolts the phone. Wait until it settles so both the
     // main shot and the tracking reference are sharp.
@@ -421,6 +429,7 @@ export class CaptureView {
       if (this.state !== 'capturing') return;
     }
     const full = this.camera.grabFull();
+    const tSmall = performance.now();
     const small = this.camera.grabTrack();
     if (!full || !small) { this.state = 'aim'; return; }
     this.flash();
@@ -436,16 +445,19 @@ export class CaptureView {
       this.trackW = small.width;
       this.trackH = small.height;
       this.setupDots();
-      // Only a single photo's outline is passed: it lets the tracker prefer
-      // features on the print over a plain or patterned table.
-      const quad = this.hintQuads.length === 1 ? this.guideQuad : null;
+      // The photo's outline (or the area of all photos on an album page) lets
+      // the tracker prefer features there over a plain or patterned table.
+      const quad = this.hintQuads.length ? this.guideQuad : null;
       await this.worker.call('trackStart', { image: small, quad }, { transfer: [small.data.buffer] });
+      this.gyroModel = this.gyro.start(this.trackW, this.trackH);
     } catch (e) {
       toast('Capture failed: ' + e.message);
       this.state = 'aim';
       return;
     }
     this.H = [1, 0, 0, 0, 1, 0, 0, 0, 1];
+    this.lastTrack = { t: tSmall, H: this.H };
+    this.refTime = tSmall;
     this.trackOk = true;
     this.lastTrackOk = performance.now();
     this.state = 'guided';
@@ -478,18 +490,36 @@ export class CaptureView {
     this.progressEl.textContent = `${done} of ${this.dots ? this.dots.length : 4}`;
   }
 
+  stopGyro() {
+    this.gyro.stop();
+    this.gyroModel = null;
+    this.lastTrack = null;
+  }
+
+  // Where the photo is now: the last tracking result, carried forward by
+  // the phone's rotation since that frame (tracking results arrive a few
+  // times per second and describe a frame that is already a moment old).
+  currentH(now) {
+    if (!this.lastTrack) return this.H;
+    const p = this.gyroModel && this.gyroModel.predict(this.lastTrack.t, now);
+    return p ? mul3(p, this.lastTrack.H) : this.lastTrack.H;
+  }
+
   maybeTrack() {
     if (this.tracking || this.capturingDot) return;
+    const t = performance.now();
     const img = this.camera.grabTrack();
     if (!img) return;
     this.tracking = true;
-    this.worker.call('track', { image: img }, { transfer: [img.data.buffer] })
-      .then((r) => this.onTrack(r))
+    // Expected motion since the last tracked frame helps with fast moves.
+    const predict = this.gyroModel && this.lastTrack ? this.gyroModel.predict(this.lastTrack.t, t) : null;
+    this.worker.call('track', { image: img, predict }, { transfer: [img.data.buffer] })
+      .then((r) => this.onTrack(r, t))
       .catch(() => {})
       .finally(() => { this.tracking = false; });
   }
 
-  async onTrack(r) {
+  async onTrack(r, t) {
     if (this.state !== 'guided') return;
     const now = performance.now();
     if (!r) {
@@ -503,12 +533,15 @@ export class CaptureView {
     this.trackOk = true;
     this.lastTrackOk = now;
     this.H = r.H;
+    if (this.lastTrack && this.gyroModel) this.gyroModel.observe(this.lastTrack.t, t, this.lastTrack.H, r.H);
+    this.lastTrack = { t, H: r.H };
+    const Hnow = this.currentH(now);
     const rect = this.displayRect();
     const cx = rect.x + rect.w / 2, cy = rect.y + rect.h / 2;
     const R = Math.min(rect.w, rect.h) * 0.085;
     for (const d of this.dots) {
       if (d.done) continue;
-      const q = applyH(this.H, d.p);
+      const q = applyH(Hnow, d.p);
       const s = this.toScreen([q[0] / this.trackW, q[1] / this.trackH]);
       const inside = Math.hypot(s[0] - cx, s[1] - cy) < R;
       const settled = d.last && Math.hypot(s[0] - d.last[0], s[1] - d.last[1]) < R * 0.6;
@@ -546,6 +579,7 @@ export class CaptureView {
     this.running = false;
     cancelAnimationFrame(this.raf);
     this.setGuidedUi(false);
+    this.stopGyro();
     this.hint('');
     const sid = this.sid;
     this.sid = null;

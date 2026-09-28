@@ -1702,17 +1702,32 @@
     return Hi ? applyH(Hi, [tr.w / 2, tr.h / 2]) : [Infinity, Infinity];
   }
 
-  function flowStep(tr, gray) {
+  // predict (optional): expected motion from the last tracked frame to this
+  // one (3x3, from the phone's gyroscope). Points start their search there,
+  // which keeps fast moves within reach.
+  function flowStep(tr, gray, predict) {
     const n = tr.cur.length / 2;
     if (n < 12) return null;
     const s = scope();
     try {
       const p0 = s(cv.matFromArray(n, 1, cv.CV_32FC2, Array.from(tr.cur)));
-      const p1 = s(new cv.Mat()), back = s(new cv.Mat());
+      let p1, flags = 0;
+      if (predict) {
+        const guess = new Array(n * 2);
+        for (let i = 0; i < n; i++) {
+          const q = applyH(predict, [tr.cur[i * 2], tr.cur[i * 2 + 1]]);
+          guess[i * 2] = q[0]; guess[i * 2 + 1] = q[1];
+        }
+        p1 = s(cv.matFromArray(n, 1, cv.CV_32FC2, guess));
+        flags = cv.OPTFLOW_USE_INITIAL_FLOW;
+      } else {
+        p1 = s(new cv.Mat());
+      }
+      const back = s(new cv.Mat());
       const st1 = s(new cv.Mat()), st2 = s(new cv.Mat()), e1 = s(new cv.Mat()), e2 = s(new cv.Mat());
       const crit = new cv.TermCriteria(cv.TermCriteria_COUNT + cv.TermCriteria_EPS, 20, 0.03);
       const win = new cv.Size(TRACKING.win, TRACKING.win);
-      cv.calcOpticalFlowPyrLK(tr.prev, gray, p0, p1, st1, e1, win, TRACKING.levels, crit);
+      cv.calcOpticalFlowPyrLK(tr.prev, gray, p0, p1, st1, e1, win, TRACKING.levels, crit, flags);
       cv.calcOpticalFlowPyrLK(gray, tr.prev, p1, back, st2, e2, win, TRACKING.levels, crit);
       const a = [], b = [];
       const P0 = tr.cur, P1 = p1.data32F, PB = back.data32F, S1 = st1.data, S2 = st2.data;
@@ -1863,22 +1878,38 @@
     tr.ref = Float32Array.from(ref);
   }
 
-  /** Returns { H: ref->current (3x3 array), inliers, mode } or null when lost. */
-  function trackFrame(tr, gray) {
+  /**
+   * Returns { H: ref->current (3x3 array), inliers, mode } or null when lost.
+   * opts.predict: expected motion since the last tracked frame (see flowStep).
+   */
+  function trackFrame(tr, gray, opts) {
+    const predict = opts && opts.predict && opts.predict.length === 9 ? opts.predict : null;
     let result = null;
     let reset = false;
     const hp = flowImage(gray);
-    const flow = flowStep(tr, hp);
+    const flow = flowStep(tr, hp, predict);
     if (flow) result = { H: flow.H, inliers: flow.inliers, mode: 'flow' };
     tr.sinceCheck++;
     // Re-anchor every few frames, and immediately when flow support is thin.
     if (!result || tr.sinceCheck >= 6 || result.inliers < 30) {
       tr.sinceCheck = 0;
-      const last = viewCentre(tr, tr.H);
+      const last = viewCentre(tr, predict ? mul3(predict, tr.H) : tr.H);
       // The phone can only move so far between updates; allow more the
       // longer tracking has been lost.
       const maxJump = Math.min(tr.w, tr.h) * (0.3 + 0.25 * tr.missed);
-      const orb = relocalise(tr, gray, last, maxJump);
+      let orb = relocalise(tr, gray, last, maxJump);
+      // With the phone's rotation known, a found position far from where it
+      // says the photo should be is a false match (a reflection, a repeated
+      // pattern): wait for a better one.
+      if (orb && predict) {
+        const Hp = mul3(predict, tr.H);
+        const probe = [[tr.w * 0.25, tr.h * 0.25], [tr.w * 0.75, tr.h * 0.25], [tr.w * 0.75, tr.h * 0.75], [tr.w * 0.25, tr.h * 0.75]];
+        const off = Math.max(...probe.map((p) => {
+          const u = applyH(Hp, p), v = applyH(orb.H, p);
+          return Math.hypot(u[0] - v[0], u[1] - v[1]);
+        }));
+        if (off > Math.min(tr.w, tr.h) * 0.2) orb = null;
+      }
       if (orb) {
         if (!result) {
           result = { H: orb.H, inliers: orb.inliers, mode: 'orb' };

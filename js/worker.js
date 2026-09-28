@@ -97,11 +97,11 @@ function cmdTrackStart({ image, quad }) {
   }
 }
 
-function cmdTrack({ image }) {
+function cmdTrack({ image, predict }) {
   if (!tracker) return null;
   const g = smallGray(image);
   try {
-    const r = P.trackFrame(tracker, g);
+    const r = P.trackFrame(tracker, g, { predict });
     return r ? { H: r.H, inliers: r.inliers, mode: r.mode } : null;
   } finally {
     g.delete();
